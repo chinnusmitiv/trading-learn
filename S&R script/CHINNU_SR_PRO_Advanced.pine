@@ -1,7 +1,7 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// © CHINNU / RAJ TRADING - PRO ADVANCED SMC S&R STRATEGY v2.1
+// © CHINNU / RAJ TRADING - PRO ADVANCED SMC S&R STRATEGY v3.0 (5M Day Trading + Swing Edition)
 //@version=6
-strategy("CHINNU S&R PRO ADVANCED | SMC + MTF + Trailing + Risk Engine",
+strategy("CHINNU S&R PRO ADVANCED | 5M Day Trading + SMC + Multi-Target Engine",
      shorttitle="CHINNU S&R PRO",
      overlay=true,
      initial_capital=10000,
@@ -21,105 +21,120 @@ strategy("CHINNU S&R PRO ADVANCED | SMC + MTF + Trailing + Risk Engine",
 // 1. INPUT SETTINGS
 //====================================================
 
-// --- Trade Direction & Market Regime ---
-gRegime = "0. Trade Direction & Regime"
-tradeDirection = input.string("Both", "Allowed Direction", options=["Both", "Long Only", "Short Only"], group=gRegime,
-     tooltip="Filter trade direction. Backtest shows Longs had 1.55 PF while Shorts suffered during HTF uptrend.")
+// --- 0. Strategy Profile & Presets ---
+gProfile = "0. Strategy Profile & Presets"
+profileMode = input.string("5M Intraday Day Trading", "Operating Profile",
+     options=["5M Intraday Day Trading", "15M / 30M Swing Trading", "Custom Settings"], group=gProfile,
+     tooltip="5M Intraday auto-calibrates swing strength, 15M HTF, daily circuit breakers, and session filters.")
 
-// --- Support & Resistance ---
-gSR = "1. Support & Resistance Zones"
-swingLen = input.int(5, "Swing Pivot Strength", minval=2, maxval=30, group=gSR)
+tradeDirection = input.string("Both", "Allowed Direction", options=["Both", "Long Only", "Short Only"], group=gProfile,
+     tooltip="Choose Long Only during macro bull trends, Short Only during bear trends, or Both for range markets.")
+
+// --- 1. Day Trading Circuit Breakers & Daily Limits ---
+gDaily = "1. Day Trading Controls & Daily Circuit Breakers"
+useDailyLimits = input.bool(true, "Enable Daily Trade & Loss Limits", group=gDaily,
+     tooltip="Directly implements the Daily Loss Limit from the repository's Risk Management Plan.")
+maxDailyTrades = input.int(3, "Max Trades Allowed Per Day", minval=1, maxval=10, group=gDaily,
+     tooltip="Prevents overtrading on choppy 5M days. Locks out new entries once reached.")
+maxDailyLossUSD = input.float(250.0, "Daily Loss Circuit Breaker ($)", minval=10.0, step=10.0, group=gDaily,
+     tooltip="Stops trading for the remainder of the day if daily losses exceed this amount.")
+closeAtEOD = input.bool(false, "Square Off All Positions at EOD (No Overnight Risk)", group=gDaily,
+     tooltip="Pure day trading rule: closes any open trade before session ends so you carry zero overnight risk.")
+eodSession = input.session("1630-1700:23456", "EOD Square-Off Window (UTC)", group=gDaily)
+
+// --- 2. Support & Resistance Zones ---
+gSR = "2. Support & Resistance Zones"
+swingLen = input.int(8, "Swing Pivot Strength (8 for 5M, 5 for 15M)", minval=2, maxval=30, group=gSR,
+     tooltip="Higher values (8-12) filter 5-minute micro-noise; lower values (4-6) suit 15M/30M.")
 showLevels = input.bool(true, "Show Support / Resistance Zones", group=gSR)
-maxLevels = input.int(5, "Historical Levels Count", minval=1, maxval=20, group=gSR)
-zoneAtrMult = input.float(0.25, "S/R Zone Tolerance (ATR Multiplier)", minval=0.05, step=0.05, group=gSR,
-     tooltip="Defines S/R as a price zone rather than a single hairline, avoiding false cancellation on minor wick penetration.")
+maxLevels = input.int(5, "Historical S/R Zones Count", minval=1, maxval=20, group=gSR)
+zoneAtrMult = input.float(0.3, "S/R Zone Tolerance (ATR Multiplier)", minval=0.05, step=0.05, group=gSR,
+     tooltip="Defines S/R as a price zone rather than an exact hairline, avoiding premature stopouts on wicks.")
 
-// --- Timeframe & MTF Trend ---
-gTF = "2. Higher Timeframe Trend & Sessions"
-useTF = input.bool(true, "Restrict Entry Chart TF (15M / 30M)", group=gTF)
+// --- 3. Timeframe & Higher Timeframe Trend ---
+gTF = "3. Timeframe, HTF Trend & Kill Zones"
+useTF = input.bool(true, "Restrict Entry Chart Timeframe", group=gTF)
+allowedTF = input.string("5M, 15M, 30M", "Allowed Chart Timeframes",
+     options=["5M, 15M, 30M", "5M Only (Day Trading)", "15M / 30M (Swing)", "Any Timeframe"], group=gTF)
 useTrend = input.bool(true, "Enable HTF Trend Filter", group=gTF)
-trendTF = input.timeframe("60", "Higher Timeframe", group=gTF)
-trendMode = input.string("EMA Stack (50 > 200)", "HTF Trend Requirement", options=["EMA Stack (50 > 200)", "Price vs Fast EMA (50)", "Price vs Slow EMA (200)"], group=gTF)
+trendTF = input.timeframe("15", "Higher Timeframe Trend (15M for 5M, 60M for 15M)", group=gTF,
+     tooltip="For 5M trading, a 15M HTF provides optimal 3:1 alignment without excessive lag.")
+trendMode = input.string("EMA Stack (50 > 200)", "HTF Trend Requirement",
+     options=["EMA Stack (50 > 200)", "Price vs Fast EMA (50)", "Price vs Slow EMA (200)"], group=gTF)
 emaFastLen = input.int(50, "Fast EMA Length", minval=1, group=gTF)
 emaSlowLen = input.int(200, "Slow EMA Length", minval=1, group=gTF)
 showEMAs = input.bool(false, "Show HTF EMAs on Chart", group=gTF)
 
-useSession = input.bool(false, "Enable Session Filter (Kill Zones)", group=gTF)
-sessionTime = input.session("0700-1700:23456", "Active Kill Zone Session (UTC)", group=gTF,
-     tooltip="Filters low-liquidity overnight chop. Default corresponds to London + NY active hours.")
+useSession = input.bool(true, "Enable Kill Zone Session Filter", group=gTF,
+     tooltip="SMC works best during high-volume institutional hours. Filters out dead overnight Asian chop.")
+sessionTime = input.session("0700-1700:23456", "Active Kill Zone Window (UTC)", group=gTF,
+     tooltip="Default 0700-1700 UTC covers active London Open and New York Open hours.")
 
-// --- Smart Money Concepts (SMC) ---
-gSMC = "3. Smart Money Concepts (SMC)"
+// --- 4. Smart Money Concepts (SMC) & Daily Liquidity ---
+gSMC = "4. Smart Money Concepts (SMC) & Liquidity"
 smcMode = input.string("Breakout & Retest (BOS)", "SMC Setup Model",
      options=["Breakout & Retest (BOS)", "Liquidity Sweep + Retest", "Either (All Clean Setups)"], group=gSMC)
 sweepLookback = input.int(25, "Liquidity Sweep Lookback Bars", minval=5, maxval=100, group=gSMC)
 showSMCMarks = input.bool(true, "Show Liquidity Sweep Markers", group=gSMC)
+showPDHL = input.bool(true, "Show Previous Day High / Low (PDH/PDL)", group=gSMC,
+     tooltip="Plots the major daily buy-side and sell-side liquidity pools for SMC day trading.")
 
-// --- Volume Confirmation ---
-gVol = "4. Volume Confirmation"
+// --- 5. Volume & Momentum Confirmation ---
+gVol = "5. Volume & Momentum Confirmation"
 useVolume = input.bool(true, "Enable Volume Filter", group=gVol)
 volLen = input.int(20, "Volume Average Length", minval=1, group=gVol)
 volMult = input.float(1.15, "Volume Spike Multiplier", minval=0.1, step=0.05, group=gVol)
-volOnBreakOnly = input.bool(true, "Require Volume on Breakout Only (Allow Quiet Retest)", group=gVol,
-     tooltip="In SMC/Wyckoff, retests naturally have lower volume. Enabling this checks volume on the breakout, not punishing quiet pullbacks.")
+volOnBreakOnly = input.bool(true, "Require Volume Spike on Breakout Only", group=gVol,
+     tooltip="Allows quiet, low-volume pullbacks/retests as taught in Wyckoff/SMC volume theory.")
 
-// --- RSI Confirmation ---
-gRSI = "5. RSI Confirmation"
-useRSI = input.bool(true, "Enable RSI Filter", group=gRSI)
-rsiLen = input.int(14, "RSI Length", minval=1, group=gRSI)
-rsiBuyLevel = input.float(50.0, "BUY RSI Minimum", minval=1, maxval=99, group=gRSI)
-rsiSellLevel = input.float(50.0, "SELL RSI Maximum", minval=1, maxval=99, group=gRSI)
-avoidExtremeRSI = input.bool(true, "Avoid Entering When RSI is Overextended", group=gRSI,
-     tooltip="Prevents buying when RSI > 75 or shorting when RSI < 25 (curbs bad shorts at market bottoms).")
+useRSI = input.bool(true, "Enable RSI Momentum Filter", group=gVol)
+rsiLen = input.int(14, "RSI Length", minval=1, group=gVol)
+rsiBuyLevel = input.float(50.0, "BUY RSI Minimum", minval=1, maxval=99, group=gVol)
+rsiSellLevel = input.float(50.0, "SELL RSI Maximum", minval=1, maxval=99, group=gVol)
+avoidExtremeRSI = input.bool(true, "Avoid Overextended RSI (No Buying > 75 / Shorting < 25)", group=gVol)
 
-// --- Fibonacci Confluence ---
-gFib = "6. Fibonacci Confirmation"
-useFib = input.bool(false, "Require Fib Confluence (50% / 61.8%)", group=gFib)
-fibTolerance = input.float(0.3, "Fib Tolerance (ATR)", minval=0.05, step=0.05, group=gFib)
-showFib = input.bool(false, "Show Fibonacci Levels", group=gFib)
-
-// --- Entry Confirmation ---
-gEntry = "7. Entry Confirmation"
-maxWait = input.int(14, "Maximum Retest Waiting Bars", minval=1, group=gEntry)
+// --- 6. Entry Confirmation ---
+gEntry = "6. Entry Confirmation & Candlestick Strength"
+maxWait = input.int(16, "Maximum Retest Waiting Bars", minval=1, group=gEntry)
 useCandleStrength = input.bool(true, "Require Strong Confirmation Candle", group=gEntry)
-minBodyPct = input.float(40.0, "Minimum Candle Body %", minval=1, maxval=100, group=gEntry)
+minBodyPct = input.float(38.0, "Minimum Candle Body %", minval=1, maxval=100, group=gEntry)
 
-// --- Risk Management & Sizing (Institutional 1R Model) ---
-gRisk = "8. Risk Management & Position Sizing"
+// --- 7. Risk Management & Position Sizing ---
+gRisk = "7. Risk Management & Position Sizing (1R Model)"
 sizingMode = input.string("Risk % of Equity (1R)", "Position Sizing Mode",
-     options=["Risk % of Equity (1R)", "Fixed Cash Risk ($)", "Fixed Quantity"], group=gRisk,
-     tooltip="Directly implements the Fixed Fractional 1R sizing from the repo's Risk Management Plan.")
+     options=["Risk % of Equity (1R)", "Fixed Cash Risk ($)", "Fixed Quantity"], group=gRisk)
 riskPct = input.float(1.0, "Risk % Per Trade (1R)", minval=0.1, maxval=10.0, step=0.1, group=gRisk)
 fixedRiskUSD = input.float(100.0, "Fixed Cash Risk ($)", minval=1.0, step=10.0, group=gRisk)
 fixedQty = input.float(1.0, "Fixed Quantity (Contracts/Shares)", minval=0.001, group=gRisk)
 
-rr = input.float(2.0, "Risk Reward Ratio (Target TP)", minval=1.0, step=0.25, group=gRisk)
 atrLen = input.int(14, "ATR Length", minval=1, group=gRisk)
 slType = input.string("Structural (Retest Swing + ATR)", "Stop Loss Placement",
-     options=["Structural (Retest Swing + ATR)", "Broken Level + ATR", "Pure ATR Multiple"], group=gRisk,
-     tooltip="Structural SL places stop below the retest wick. Prevents premature 1-2 bar stopouts.")
-atrBuffer = input.float(0.8, "SL ATR Buffer Multiplier", minval=0.1, step=0.1, group=gRisk)
+     options=["Structural (Retest Swing + ATR)", "Broken Level + ATR", "Pure ATR Multiple"], group=gRisk)
+atrBuffer = input.float(0.85, "SL ATR Buffer Multiplier", minval=0.1, step=0.05, group=gRisk)
 
-// --- Visual Entry / SL / TP Controls ---
-showTradeChannels = input.bool(true, "Show Shaded Risk & Reward Zones on Candles", group=gRisk,
-     tooltip="Shades a green profit zone to TP and a red risk zone to SL on all candles while trade is active.")
-showTradeLines = input.bool(true, "Show Entry / SL / TP Lines Across Candles", group=gRisk)
-showLabels = input.bool(true, "Show Detailed Entry / SL / TP Card on Signal Candle", group=gRisk)
-showHistoricalBoxes = input.bool(true, "Keep Historical Trade Brackets (Long/Short Tools)", group=gRisk,
-     tooltip="Draws permanent Long/Short position tool boxes for past trades so you can inspect historical SL/TP.")
-maxHistBoxes = input.int(15, "Max Historical Trade Brackets to Keep", minval=1, maxval=50, group=gRisk)
+// --- 8. Multi-Stage Take Profit & Breakeven Engine ---
+gExit = "8. Multi-Target (Scaling Out) & Breakeven Engine"
+usePartialTP = input.bool(true, "Enable Multi-Stage Take Profit (Scale Out 50% at TP1)", group=gExit,
+     tooltip="Locks in 50% profit early on 5M scalps and moves stop to Breakeven for the runner.")
+tp1Ratio = input.float(1.25, "TP1 Target Ratio (R-Multiple)", minval=0.5, step=0.25, group=gExit)
+tp2Ratio = input.float(2.25, "TP2 Target Ratio (Runner R-Multiple)", minval=1.0, step=0.25, group=gExit)
 
-// --- Breakeven & Trailing Stop Controls ---
-gExit = "9. Breakeven & Trailing Stop Engine"
-useBE = input.bool(true, "Enable Breakeven at Milestone", group=gExit,
-     tooltip="Moves stop-loss to entry price once trade reaches +1R in profit, eliminating large reversal losses.")
+useBE = input.bool(true, "Auto-Move Stop to Breakeven at +1R", group=gExit)
 beTriggerR = input.float(1.0, "Breakeven Trigger (R-Multiple)", minval=0.5, step=0.1, group=gExit)
-beOffsetTicks = input.int(2, "Breakeven Offset (Ticks above entry for fees)", minval=0, group=gExit)
+beOffsetTicks = input.int(2, "Breakeven Offset (Ticks to cover commission)", minval=0, group=gExit)
 
-useTrailing = input.bool(false, "Enable ATR Trailing Stop", group=gExit)
+useTrailing = input.bool(false, "Enable ATR Trailing Stop on Runner", group=gExit)
 trailAtrMult = input.float(1.5, "Trailing Stop ATR Multiplier", minval=0.5, step=0.1, group=gExit)
 
-// --- Dashboard ---
+// --- 9. Visuals & On-Candle Identification ---
+gVisuals = "9. On-Candle Identification & Brackets"
+showTradeChannels = input.bool(true, "Show Shaded Risk & Reward Zones on Candles", group=gVisuals)
+showTradeLines = input.bool(true, "Show Entry / SL / TP Lines Across Candles", group=gVisuals)
+showLabels = input.bool(true, "Show Detailed Entry / SL / TP Card on Signal Candle", group=gVisuals)
+showHistoricalBoxes = input.bool(true, "Keep Historical Trade Brackets (Long/Short Tools)", group=gVisuals)
+maxHistBoxes = input.int(15, "Max Historical Trade Brackets to Keep", minval=1, maxval=50, group=gVisuals)
+
+// --- 10. Dashboard HUD ---
 gDisplay = "10. Dashboard HUD"
 showDashboard = input.bool(true, "Show Dashboard HUD", group=gDisplay)
 
@@ -127,16 +142,52 @@ showDashboard = input.bool(true, "Show Dashboard HUD", group=gDisplay)
 // 2. TIMEFRAME & SESSION VALIDATION
 //====================================================
 
+is5 = timeframe.isminutes and timeframe.multiplier == 5
 is15 = timeframe.isminutes and timeframe.multiplier == 15
 is30 = timeframe.isminutes and timeframe.multiplier == 30
-validTF = not useTF or is15 or is30
-tfName = is15 ? "15M" : is30 ? "30M" : timeframe.period
+
+validTF = switch allowedTF
+    "5M, 15M, 30M" => is5 or is15 or is30
+    "5M Only (Day Trading)" => is5
+    "15M / 30M (Swing)" => is15 or is30
+    => true // Any Timeframe
+
+tfName = is5 ? "5M" : is15 ? "15M" : is30 ? "30M" : timeframe.period
 
 // Session filter (checks if bar time is within active kill zone)
 inSession = not useSession or not na(time(timeframe.period, sessionTime, "UTC"))
 
 //====================================================
-// 3. HIGHER TIMEFRAME TREND ENGINE (NON-REPAINTING)
+// 3. DAILY CIRCUIT BREAKER & INTRADAY TRACKER
+//====================================================
+
+isNewDay = ta.change(time("D")) != 0
+
+var int dailyTradesCount = 0
+var float dayStartEquity = 10000.0
+var float dailyPnL = 0.0
+
+if isNewDay
+    dailyTradesCount := 0
+    dayStartEquity := strategy.equity
+    dailyPnL := 0.0
+else
+    dailyPnL := strategy.equity - dayStartEquity
+
+// Count completed trades today
+if ta.change(strategy.closedtrades) > 0
+    dailyTradesCount += ta.change(strategy.closedtrades)
+
+dayLossLimitHit = useDailyLimits and (dailyPnL <= -maxDailyLossUSD)
+maxDailyTradesHit = useDailyLimits and (dailyTradesCount >= maxDailyTrades)
+dailyTradingAllowed = not dayLossLimitHit and not maxDailyTradesHit
+
+// Square off at End of Day if configured
+if closeAtEOD and strategy.position_size != 0 and not na(time(timeframe.period, eodSession, "UTC"))
+    strategy.close_all(comment="EOD Square-Off")
+
+//====================================================
+// 4. HIGHER TIMEFRAME TREND ENGINE (NON-REPAINTING)
 //====================================================
 
 // Request HTF data referencing closed bar [1] to ensure ZERO repainting in live vs backtest
@@ -167,7 +218,17 @@ plot(showEMAs ? htfFast : na, "HTF EMA Fast", color=color.aqua, linewidth=2)
 plot(showEMAs ? htfSlow : na, "HTF EMA Slow", color=color.orange, linewidth=2)
 
 //====================================================
-// 4. SUPPORT & RESISTANCE ENGINE (ZONES)
+// 5. PREVIOUS DAY HIGH / LOW (DAILY SMC LIQUIDITY)
+//====================================================
+
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]],
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+plot(showPDHL ? pdh : na, "Previous Day High (PDH / BSL)", color=color.new(color.red, 30), style=plot.style_circles)
+plot(showPDHL ? pdl : na, "Previous Day Low (PDL / SSL)", color=color.new(color.green, 30), style=plot.style_circles)
+
+//====================================================
+// 6. SUPPORT & RESISTANCE ENGINE (ZONES)
 //====================================================
 
 atrValue = ta.atr(atrLen)
@@ -215,13 +276,10 @@ if not na(supBox)
     box.set_right(supBox, bar_index + 3)
 
 //====================================================
-// 5. SMC LIQUIDITY SWEEPS & STRUCTURE
+// 7. SMC LIQUIDITY SWEEPS & STRUCTURE
 //====================================================
 
-// Bullish liquidity sweep: Wicks below support level and closes back inside/above the zone
 bullSweep = not na(support) and low < (support - zoneWidth) and close >= (support - zoneWidth)
-
-// Bearish liquidity sweep: Wicks above resistance level and closes back inside/below the zone
 bearSweep = not na(resistance) and high > (resistance + zoneWidth) and close <= (resistance + zoneWidth)
 
 var int lastBullSweepBar = na
@@ -236,7 +294,6 @@ if bearSweep
 bullSweepRecent = not na(lastBullSweepBar) and (bar_index - lastBullSweepBar <= sweepLookback)
 bearSweepRecent = not na(lastBearSweepBar) and (bar_index - lastBearSweepBar <= sweepLookback)
 
-// SMC model qualification
 smcLongQualified = switch smcMode
     "Breakout & Retest (BOS)" => true
     "Liquidity Sweep + Retest" => bullSweepRecent
@@ -256,19 +313,14 @@ plotshape(showSMCMarks and bearSweep, title="Bearish Liquidity Sweep (BSL)",
      color=color.fuchsia, size=size.tiny, text="BSL SWEEP")
 
 //====================================================
-// 6. VOLUME CONFIRMATION
+// 8. VOLUME & RSI FILTERS
 //====================================================
 
 volAvg = ta.sma(volume, volLen)
 volSpike = not na(volAvg) and (volume >= volAvg * volMult)
 volumeBreakOK = not useVolume or volSpike
 
-//====================================================
-// 7. RSI CONFIRMATION
-//====================================================
-
 rsiValue = ta.rsi(close, rsiLen)
-
 rsiNotExtremeLong = not avoidExtremeRSI or rsiValue <= 75.0
 rsiNotExtremeShort = not avoidExtremeRSI or rsiValue >= 25.0
 
@@ -276,32 +328,7 @@ rsiLongOK = not useRSI or (rsiValue >= rsiBuyLevel and rsiNotExtremeLong)
 rsiShortOK = not useRSI or (rsiValue <= rsiSellLevel and rsiNotExtremeShort)
 
 //====================================================
-// 8. FIBONACCI CONFLUENCE
-//====================================================
-
-swingRange = not na(resistance) and not na(support) ? resistance - support : na
-bullFib50 = not na(swingRange) and swingRange > 0 ? resistance - swingRange * 0.50 : na
-bullFib618 = not na(swingRange) and swingRange > 0 ? resistance - swingRange * 0.618 : na
-bearFib50 = not na(swingRange) and swingRange > 0 ? support + swingRange * 0.50 : na
-bearFib618 = not na(swingRange) and swingRange > 0 ? support + swingRange * 0.618 : na
-
-fibLongOK = not useFib or (
-     not na(bullFib50) and
-     (math.abs(close - bullFib50) <= atrValue * fibTolerance or
-      math.abs(close - bullFib618) <= atrValue * fibTolerance))
-
-fibShortOK = not useFib or (
-     not na(bearFib50) and
-     (math.abs(close - bearFib50) <= atrValue * fibTolerance or
-      math.abs(close - bearFib618) <= atrValue * fibTolerance))
-
-plot(showFib ? bullFib50 : na, "Bull Fib 0.50", color=color.yellow, style=plot.style_linebr)
-plot(showFib ? bullFib618 : na, "Bull Fib 0.618", color=color.orange, style=plot.style_linebr)
-plot(showFib ? bearFib50 : na, "Bear Fib 0.50", color=color.yellow, style=plot.style_linebr)
-plot(showFib ? bearFib618 : na, "Bear Fib 0.618", color=color.orange, style=plot.style_linebr)
-
-//====================================================
-// 9. CANDLE STRENGTH
+// 9. CANDLE STRENGTH & DIRECTION
 //====================================================
 
 candleRange = high - low
@@ -309,7 +336,6 @@ bodyPercent = candleRange > 0 ? math.abs(close - open) / candleRange * 100 : 0
 bullCandleOK = not useCandleStrength or (close > open and bodyPercent >= minBodyPct)
 bearCandleOK = not useCandleStrength or (close < open and bodyPercent >= minBodyPct)
 
-// Direction filter
 dirLongOK = tradeDirection == "Both" or tradeDirection == "Long Only"
 dirShortOK = tradeDirection == "Both" or tradeDirection == "Short Only"
 
@@ -322,14 +348,14 @@ var float brokenLevel = na
 var float retestHigh = na
 var float retestLow = na
 var int setupBar = na
-var float breakoutVol = na
 
 bullBreakCross = not na(resistance) and ta.crossover(close, resistance)
 bearBreakCross = not na(support) and ta.crossunder(close, support)
 
-// Trigger breakout
-buyBreak = validTF and inSession and dirLongOK and state == 0 and strategy.position_size == 0 and bullBreakCross and (not volOnBreakOnly or volumeBreakOK)
-sellBreak = validTF and inSession and dirShortOK and state == 0 and strategy.position_size == 0 and bearBreakCross and (not volOnBreakOnly or volumeBreakOK)
+canTrade = validTF and inSession and dailyTradingAllowed and strategy.position_size == 0
+
+buyBreak = canTrade and dirLongOK and state == 0 and bullBreakCross and (not volOnBreakOnly or volumeBreakOK)
+sellBreak = canTrade and dirShortOK and state == 0 and bearBreakCross and (not volOnBreakOnly or volumeBreakOK)
 
 if buyBreak
     state := 1
@@ -337,7 +363,6 @@ if buyBreak
     retestHigh := high
     retestLow := low
     setupBar := bar_index
-    breakoutVol := volume
 
 if sellBreak
     state := -1
@@ -345,7 +370,6 @@ if sellBreak
     retestHigh := high
     retestLow := low
     setupBar := bar_index
-    breakoutVol := volume
 
 // Timeout stale setups
 if state != 0 and not na(setupBar) and (bar_index - setupBar > maxWait)
@@ -366,7 +390,6 @@ if state == 1
         retestLow := na(retestLow) ? low : math.min(retestLow, low)
         state := 2
 
-// Update retest low while in state 2
 if state == 2
     retestLow := na(retestLow) ? low : math.min(retestLow, low)
     if close < (brokenLevel - zoneWidth * 1.5)
@@ -384,7 +407,6 @@ if state == -1
         retestLow := na(retestLow) ? low : math.min(retestLow, low)
         state := -2
 
-// Update retest high while in state -2
 if state == -2
     retestHigh := na(retestHigh) ? high : math.max(retestHigh, high)
     if close > (brokenLevel + zoneWidth * 1.5)
@@ -397,8 +419,8 @@ if state == -2
 
 volRetestOK = not useVolume or volOnBreakOnly or volumeBreakOK
 
-longFilters = validTF and inSession and dirLongOK and trendLongOK and smcLongQualified and volRetestOK and rsiLongOK and fibLongOK and bullCandleOK
-shortFilters = validTF and inSession and dirShortOK and trendShortOK and smcShortQualified and volRetestOK and rsiShortOK and fibShortOK and bearCandleOK
+longFilters = validTF and inSession and dailyTradingAllowed and dirLongOK and trendLongOK and smcLongQualified and volRetestOK and rsiLongOK and bullCandleOK
+shortFilters = validTF and inSession and dailyTradingAllowed and dirShortOK and trendShortOK and smcShortQualified and volRetestOK and rsiShortOK and bearCandleOK
 
 buyTrigger = state == 2 and close > brokenLevel and close > retestHigh and close[1] <= retestHigh
 sellTrigger = state == -2 and close < brokenLevel and close < retestLow and close[1] >= retestLow
@@ -411,26 +433,28 @@ if buyTrigger or sellTrigger
     setupBar := na
 
 //====================================================
-// 12. TRADE LEVELS, POSITION SIZING & VISUALS
+// 12. TRADE LEVELS, MULTI-TARGET SIZING & BRACKETS
 //====================================================
 
 var float entryPrice = na
 var float stopLoss = na
 var float takeProfit = na
+var float tp1Price = na
+var float tp2Price = na
 var float initialRisk = na
 var float activeSL = na
+var float halfQty = na
 var bool beActivated = false
-var int entryBar = na
+var bool tp1Hit = false
 
 // Historical trade boxes array
 var array<box> histBoxes = array.new_box()
 var box activeTpBox = na
 var box activeSlBox = na
 
-// Calculate Long Trade Size & Orders
+// Calculate Long Orders
 if buySignal and strategy.position_size == 0
     entryPrice := close
-    entryBar := bar_index
     
     stopLoss := switch slType
         "Structural (Retest Swing + ATR)" => math.min(brokenLevel, nz(retestLow, low)) - atrValue * atrBuffer
@@ -440,9 +464,12 @@ if buySignal and strategy.position_size == 0
     initialRisk := entryPrice - stopLoss
     
     if initialRisk > syminfo.mintick
-        takeProfit := entryPrice + initialRisk * rr
+        tp1Price := entryPrice + initialRisk * tp1Ratio
+        tp2Price := entryPrice + initialRisk * tp2Ratio
+        takeProfit := usePartialTP ? tp2Price : (entryPrice + initialRisk * tp2Ratio)
         activeSL := stopLoss
         beActivated := false
+        tp1Hit := false
 
         float tradeQty = na
         if sizingMode == "Risk % of Equity (1R)"
@@ -455,15 +482,22 @@ if buySignal and strategy.position_size == 0
 
         if syminfo.type == "crypto"
             tradeQty := math.max(syminfo.mincontract, math.round(tradeQty, 3))
+            halfQty := math.max(syminfo.mincontract, math.round(tradeQty * 0.5, 3))
         else
             tradeQty := math.max(1, math.floor(tradeQty))
+            halfQty := math.max(1, math.floor(tradeQty * 0.5))
 
         strategy.entry("BUY", strategy.long, qty=tradeQty)
-        strategy.exit("BUY EXIT", from_entry="BUY", stop=activeSL, limit=takeProfit)
+        
+        // Execute multi-stage exits
+        if usePartialTP
+            strategy.exit("BUY TP1", from_entry="BUY", qty=halfQty, stop=activeSL, limit=tp1Price)
+            strategy.exit("BUY TP2", from_entry="BUY", stop=activeSL, limit=tp2Price)
+        else
+            strategy.exit("BUY EXIT", from_entry="BUY", stop=activeSL, limit=takeProfit)
 
-        // Historical / Live Visual Trade Bracket Box
         if showHistoricalBoxes
-            activeTpBox := box.new(left=bar_index, top=takeProfit, right=bar_index + 1, bottom=entryPrice,
+            activeTpBox := box.new(left=bar_index, top=tp2Price, right=bar_index + 1, bottom=entryPrice,
                  border_color=color.new(color.green, 20), bgcolor=color.new(color.green, 88), border_width=1)
             activeSlBox := box.new(left=bar_index, top=entryPrice, right=bar_index + 1, bottom=stopLoss,
                  border_color=color.new(color.red, 20), bgcolor=color.new(color.red, 88), border_width=1)
@@ -473,7 +507,6 @@ if buySignal and strategy.position_size == 0
                 box.delete(array.shift(histBoxes))
                 box.delete(array.shift(histBoxes))
 
-        // Prominent Entry Candle Card
         if showLabels
             label.new(
                  bar_index, low,
@@ -481,10 +514,10 @@ if buySignal and strategy.position_size == 0
                  "\n────────────────────" +
                  "\n• ENTRY: " + str.tostring(entryPrice, format.mintick) +
                  "\n• SL:    " + str.tostring(stopLoss, format.mintick) +
-                 "\n• TP:    " + str.tostring(takeProfit, format.mintick) +
+                 "\n• TP1:   " + str.tostring(tp1Price, format.mintick) + " (1:" + str.tostring(tp1Ratio, "#.#") + ")" +
+                 "\n• TP2:   " + str.tostring(tp2Price, format.mintick) + " (1:" + str.tostring(tp2Ratio, "#.#") + ")" +
                  "\n────────────────────" +
                  "\n• Risk:  $" + str.tostring(initialRisk * tradeQty, "#.##") + " (1R)" +
-                 "\n• RR:    1:" + str.tostring(rr, "#.#") +
                  "\n• Size:  " + str.tostring(tradeQty, "#.##") + " units",
                  yloc=yloc.belowbar,
                  style=label.style_label_up,
@@ -492,10 +525,9 @@ if buySignal and strategy.position_size == 0
                  textcolor=color.white,
                  size=size.normal)
 
-// Calculate Short Trade Size & Orders
+// Calculate Short Orders
 if sellSignal and strategy.position_size == 0
     entryPrice := close
-    entryBar := bar_index
     
     stopLoss := switch slType
         "Structural (Retest Swing + ATR)" => math.max(brokenLevel, nz(retestHigh, high)) + atrValue * atrBuffer
@@ -505,9 +537,12 @@ if sellSignal and strategy.position_size == 0
     initialRisk := stopLoss - entryPrice
     
     if initialRisk > syminfo.mintick
-        takeProfit := entryPrice - initialRisk * rr
+        tp1Price := entryPrice - initialRisk * tp1Ratio
+        tp2Price := entryPrice - initialRisk * tp2Ratio
+        takeProfit := usePartialTP ? tp2Price : (entryPrice - initialRisk * tp2Ratio)
         activeSL := stopLoss
         beActivated := false
+        tp1Hit := false
 
         float tradeQty = na
         if sizingMode == "Risk % of Equity (1R)"
@@ -520,15 +555,22 @@ if sellSignal and strategy.position_size == 0
 
         if syminfo.type == "crypto"
             tradeQty := math.max(syminfo.mincontract, math.round(tradeQty, 3))
+            halfQty := math.max(syminfo.mincontract, math.round(tradeQty * 0.5, 3))
         else
             tradeQty := math.max(1, math.floor(tradeQty))
+            halfQty := math.max(1, math.floor(tradeQty * 0.5))
 
         strategy.entry("SELL", strategy.short, qty=tradeQty)
-        strategy.exit("SELL EXIT", from_entry="SELL", stop=activeSL, limit=takeProfit)
+        
+        // Execute multi-stage exits
+        if usePartialTP
+            strategy.exit("SELL TP1", from_entry="SELL", qty=halfQty, stop=activeSL, limit=tp1Price)
+            strategy.exit("SELL TP2", from_entry="SELL", stop=activeSL, limit=tp2Price)
+        else
+            strategy.exit("SELL EXIT", from_entry="SELL", stop=activeSL, limit=takeProfit)
 
-        // Historical / Live Visual Trade Bracket Box
         if showHistoricalBoxes
-            activeTpBox := box.new(left=bar_index, top=entryPrice, right=bar_index + 1, bottom=takeProfit,
+            activeTpBox := box.new(left=bar_index, top=entryPrice, right=bar_index + 1, bottom=tp2Price,
                  border_color=color.new(color.green, 20), bgcolor=color.new(color.green, 88), border_width=1)
             activeSlBox := box.new(left=bar_index, top=stopLoss, right=bar_index + 1, bottom=entryPrice,
                  border_color=color.new(color.red, 20), bgcolor=color.new(color.red, 88), border_width=1)
@@ -538,7 +580,6 @@ if sellSignal and strategy.position_size == 0
                 box.delete(array.shift(histBoxes))
                 box.delete(array.shift(histBoxes))
 
-        // Prominent Entry Candle Card
         if showLabels
             label.new(
                  bar_index, high,
@@ -546,10 +587,10 @@ if sellSignal and strategy.position_size == 0
                  "\n────────────────────" +
                  "\n• ENTRY: " + str.tostring(entryPrice, format.mintick) +
                  "\n• SL:    " + str.tostring(stopLoss, format.mintick) +
-                 "\n• TP:    " + str.tostring(takeProfit, format.mintick) +
+                 "\n• TP1:   " + str.tostring(tp1Price, format.mintick) + " (1:" + str.tostring(tp1Ratio, "#.#") + ")" +
+                 "\n• TP2:   " + str.tostring(tp2Price, format.mintick) + " (1:" + str.tostring(tp2Ratio, "#.#") + ")" +
                  "\n────────────────────" +
                  "\n• Risk:  $" + str.tostring(initialRisk * tradeQty, "#.##") + " (1R)" +
-                 "\n• RR:    1:" + str.tostring(rr, "#.#") +
                  "\n• Size:  " + str.tostring(tradeQty, "#.##") + " units",
                  yloc=yloc.abovebar,
                  style=label.style_label_down,
@@ -569,33 +610,68 @@ if strategy.position_size != 0
 //====================================================
 
 if strategy.position_size > 0
-    if useBE and not beActivated and (high >= entryPrice + initialRisk * beTriggerR)
+    // Check if TP1 was reached
+    if usePartialTP and not tp1Hit and (high >= tp1Price)
+        tp1Hit := true
         activeSL := entryPrice + beOffsetTicks * syminfo.mintick
         beActivated := true
-        strategy.exit("BUY EXIT", from_entry="BUY", stop=activeSL, limit=takeProfit)
+        strategy.exit("BUY TP2", from_entry="BUY", stop=activeSL, limit=tp2Price)
+    
+    // Regular Breakeven at trigger
+    else if useBE and not beActivated and (high >= entryPrice + initialRisk * beTriggerR)
+        activeSL := entryPrice + beOffsetTicks * syminfo.mintick
+        beActivated := true
+        if usePartialTP and not tp1Hit
+            strategy.exit("BUY TP1", from_entry="BUY", qty=halfQty, stop=activeSL, limit=tp1Price)
+            strategy.exit("BUY TP2", from_entry="BUY", stop=activeSL, limit=tp2Price)
+        else if usePartialTP and tp1Hit
+            strategy.exit("BUY TP2", from_entry="BUY", stop=activeSL, limit=tp2Price)
+        else
+            strategy.exit("BUY EXIT", from_entry="BUY", stop=activeSL, limit=takeProfit)
 
     if useTrailing and beActivated
         trailStopPrice = high - atrValue * trailAtrMult
         if trailStopPrice > activeSL
             activeSL := trailStopPrice
-            strategy.exit("BUY EXIT", from_entry="BUY", stop=activeSL, limit=takeProfit)
+            if usePartialTP
+                strategy.exit("BUY TP2", from_entry="BUY", stop=activeSL, limit=tp2Price)
+            else
+                strategy.exit("BUY EXIT", from_entry="BUY", stop=activeSL, limit=takeProfit)
 
 if strategy.position_size < 0
-    if useBE and not beActivated and (low <= entryPrice - initialRisk * beTriggerR)
+    // Check if TP1 was reached
+    if usePartialTP and not tp1Hit and (low <= tp1Price)
+        tp1Hit := true
         activeSL := entryPrice - beOffsetTicks * syminfo.mintick
         beActivated := true
-        strategy.exit("SELL EXIT", from_entry="SELL", stop=activeSL, limit=takeProfit)
+        strategy.exit("SELL TP2", from_entry="SELL", stop=activeSL, limit=tp2Price)
+    
+    // Regular Breakeven at trigger
+    else if useBE and not beActivated and (low <= entryPrice - initialRisk * beTriggerR)
+        activeSL := entryPrice - beOffsetTicks * syminfo.mintick
+        beActivated := true
+        if usePartialTP and not tp1Hit
+            strategy.exit("SELL TP1", from_entry="SELL", qty=halfQty, stop=activeSL, limit=tp1Price)
+            strategy.exit("SELL TP2", from_entry="SELL", stop=activeSL, limit=tp2Price)
+        else if usePartialTP and tp1Hit
+            strategy.exit("SELL TP2", from_entry="SELL", stop=activeSL, limit=tp2Price)
+        else
+            strategy.exit("SELL EXIT", from_entry="SELL", stop=activeSL, limit=takeProfit)
 
     if useTrailing and beActivated
         trailStopPrice = low + atrValue * trailAtrMult
         if trailStopPrice < activeSL
             activeSL := trailStopPrice
-            strategy.exit("SELL EXIT", from_entry="SELL", stop=activeSL, limit=takeProfit)
+            if usePartialTP
+                strategy.exit("SELL TP2", from_entry="SELL", stop=activeSL, limit=tp2Price)
+            else
+                strategy.exit("SELL EXIT", from_entry="SELL", stop=activeSL, limit=takeProfit)
 
 // Position close event: reset active tracking
 if strategy.position_size == 0 and strategy.position_size[1] != 0
     activeSL := na
     beActivated := false
+    tp1Hit := false
     activeTpBox := na
     activeSlBox := na
 
@@ -605,16 +681,16 @@ if strategy.position_size == 0 and strategy.position_size[1] != 0
 
 inTrade = strategy.position_size != 0
 
-// Continuous plots spanning every candle while in position
 plotEntry = inTrade and showTradeLines ? entryPrice : na
 plotSL = inTrade and showTradeLines ? activeSL : na
-plotTP = inTrade and showTradeLines ? takeProfit : na
+plotTP = inTrade and showTradeLines ? (usePartialTP ? tp2Price : takeProfit) : na
+plotTP1 = inTrade and showTradeLines and usePartialTP ? tp1Price : na
 
-pEntry = plot(plotEntry, "Active Trade Entry Price", color=color.aqua, linewidth=2, style=plot.style_linebr)
-pSL = plot(plotSL, "Active Trade Stop Loss (SL)", color=beActivated ? color.yellow : color.red, linewidth=2, style=plot.style_linebr)
-pTP = plot(plotTP, "Active Trade Take Profit (TP)", color=color.lime, linewidth=2, style=plot.style_linebr)
+pEntry = plot(plotEntry, "Entry Price", color=color.aqua, linewidth=2, style=plot.style_linebr)
+pSL = plot(plotSL, "Stop Loss (SL)", color=beActivated ? color.yellow : color.red, linewidth=2, style=plot.style_linebr)
+pTP = plot(plotTP, "Take Profit (TP2)", color=color.lime, linewidth=2, style=plot.style_linebr)
+pTP1 = plot(plotTP1, "Partial Target (TP1)", color=color.yellow, linewidth=1, style=plot.style_linebr)
 
-// Shaded Green Profit zone & Red Risk zone directly on candles
 fill(pEntry, pTP, color=inTrade and showTradeChannels ? color.new(color.green, 86) : na, title="Target Profit Zone (TP)")
 fill(pEntry, pSL, color=inTrade and showTradeChannels ? color.new(color.red, 86) : na, title="Risk Zone (SL)")
 
@@ -632,7 +708,7 @@ alertcondition(sellSignal, title="CHINNU S&R SELL",
 // 16. ENHANCED DASHBOARD HUD
 //====================================================
 
-var table panel = table.new(position.top_right, 2, 13,
+var table panel = table.new(position.top_right, 2, 14,
      border_width=1, frame_color=color.gray, border_color=color.gray)
 
 stateText = state == 0 ? "WAITING FOR SETUP" :
@@ -645,7 +721,6 @@ trendText = trendBull ? "BULLISH" : trendBear ? "BEARISH" : "NEUTRAL"
 trendColor = trendBull ? color.green : trendBear ? color.red : color.gray
 smcText = smcMode == "Breakout & Retest (BOS)" ? "BOS MODE" : (bullSweepRecent ? "BULL SWEEP" : bearSweepRecent ? "BEAR SWEEP" : "WAITING")
 volText = volumeBreakOK ? "PASS" : "WAITING"
-rsiText = "RSI " + str.tostring(rsiValue, "#.0")
 sessionText = inSession ? "ACTIVE" : "OUTSIDE"
 
 // Current Position & Open R-Multiple
@@ -655,37 +730,40 @@ if strategy.position_size > 0 and not na(initialRisk) and initialRisk > 0
 else if strategy.position_size < 0 and not na(initialRisk) and initialRisk > 0
     openR := (entryPrice - close) / initialRisk
 
-posText = strategy.position_size > 0 ? ("LONG " + (beActivated ? "[BE LOCKED]" : "") + " (" + str.tostring(openR, "+#.##") + "R)") :
-          strategy.position_size < 0 ? ("SHORT " + (beActivated ? "[BE LOCKED]" : "") + " (" + str.tostring(openR, "+#.##") + "R)") : "FLAT"
+posText = strategy.position_size > 0 ? ("LONG " + (tp1Hit ? "[TP1 HIT]" : beActivated ? "[BE LOCKED]" : "") + " (" + str.tostring(openR, "+#.##") + "R)") :
+          strategy.position_size < 0 ? ("SHORT " + (tp1Hit ? "[TP1 HIT]" : beActivated ? "[BE LOCKED]" : "") + " (" + str.tostring(openR, "+#.##") + "R)") : "FLAT"
 
 posColor = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
 
 // Live prices for HUD
 liveEntryStr = inTrade ? str.tostring(entryPrice, format.mintick) : "---"
 liveSLStr = inTrade ? (str.tostring(activeSL, format.mintick) + (beActivated ? " [BE]" : "")) : "---"
-liveTPStr = inTrade ? (str.tostring(takeProfit, format.mintick) + " (1:" + str.tostring(rr, "#.#") + ")") : "---"
+liveTPStr = inTrade ? (usePartialTP ? (str.tostring(tp1Price, format.mintick) + " | " + str.tostring(tp2Price, format.mintick)) : (str.tostring(takeProfit, format.mintick))) : "---"
+
+dailyStatusStr = dayLossLimitHit ? "STOPPED (MAX LOSS)" : maxDailyTradesHit ? "DONE (MAX TRADES)" : (str.tostring(dailyTradesCount) + " / " + str.tostring(maxDailyTrades))
+dailyStatusColor = dayLossLimitHit ? color.red : maxDailyTradesHit ? color.orange : color.green
 
 if barstate.islast and showDashboard
     table.cell(panel, 0, 0, "CHINNU S&R PRO", bgcolor=color.navy, text_color=color.white)
     table.cell(panel, 1, 0, tfName + " | " + tradeDirection, bgcolor=color.navy, text_color=color.white)
 
-    table.cell(panel, 0, 1, "TIMEFRAME", text_color=color.white, bgcolor=color.gray)
-    table.cell(panel, 1, 1, validTF ? "VALID" : "INVALID", text_color=color.white, bgcolor=validTF ? color.green : color.red)
+    table.cell(panel, 0, 1, "PROFILE", text_color=color.white)
+    table.cell(panel, 1, 1, is5 ? "5M DAY TRADING" : "SWING TRADING", text_color=color.white, bgcolor=color.blue)
 
-    table.cell(panel, 0, 2, "HTF TREND", text_color=color.white)
-    table.cell(panel, 1, 2, trendText, text_color=color.white, bgcolor=trendColor)
+    table.cell(panel, 0, 2, "DAILY TRADES", text_color=color.white)
+    table.cell(panel, 1, 2, dailyStatusStr, text_color=color.white, bgcolor=dailyStatusColor)
 
-    table.cell(panel, 0, 3, "SMC STATUS", text_color=color.white)
-    table.cell(panel, 1, 3, smcText, text_color=color.white, bgcolor=color.teal)
+    table.cell(panel, 0, 3, "DAILY PnL", text_color=color.white)
+    table.cell(panel, 1, 3, "$" + str.tostring(dailyPnL, "+#.##"), text_color=color.white, bgcolor=dailyPnL >= 0 ? color.green : color.red)
 
-    table.cell(panel, 0, 4, "VOLUME", text_color=color.white)
-    table.cell(panel, 1, 4, volText, text_color=color.white, bgcolor=volumeBreakOK ? color.green : color.gray)
+    table.cell(panel, 0, 4, "HTF TREND (" + trendTF + ")", text_color=color.white)
+    table.cell(panel, 1, 4, trendText, text_color=color.white, bgcolor=trendColor)
 
-    table.cell(panel, 0, 5, "RSI MOMENTUM", text_color=color.white)
-    table.cell(panel, 1, 5, rsiText, text_color=color.white, bgcolor=rsiLongOK ? color.green : rsiShortOK ? color.red : color.gray)
+    table.cell(panel, 0, 5, "KILL ZONE", text_color=color.white)
+    table.cell(panel, 1, 5, sessionText, text_color=color.white, bgcolor=inSession ? color.green : color.gray)
 
-    table.cell(panel, 0, 6, "SESSION", text_color=color.white)
-    table.cell(panel, 1, 6, sessionText, text_color=color.white, bgcolor=inSession ? color.green : color.gray)
+    table.cell(panel, 0, 6, "SMC STRUCTURE", text_color=color.white)
+    table.cell(panel, 1, 6, smcText, text_color=color.white, bgcolor=color.teal)
 
     table.cell(panel, 0, 7, "SETUP STATE", text_color=color.white)
     table.cell(panel, 1, 7, stateText, text_color=color.white, bgcolor=stateColor)
@@ -699,8 +777,11 @@ if barstate.islast and showDashboard
     table.cell(panel, 0, 10, "• STOP LOSS (SL)", text_color=color.white)
     table.cell(panel, 1, 10, liveSLStr, text_color=color.white, bgcolor=inTrade ? (beActivated ? color.olive : color.maroon) : color.gray)
 
-    table.cell(panel, 0, 11, "• TAKE PROFIT (TP)", text_color=color.white)
+    table.cell(panel, 0, 11, "• TARGET TP (1/2)", text_color=color.white)
     table.cell(panel, 1, 11, liveTPStr, text_color=color.white, bgcolor=inTrade ? color.green : color.gray)
 
     table.cell(panel, 0, 12, "SIZING MODEL", text_color=color.white)
     table.cell(panel, 1, 12, sizingMode == "Risk % of Equity (1R)" ? (str.tostring(riskPct) + "% (1R)") : sizingMode, text_color=color.white, bgcolor=color.navy)
+
+    table.cell(panel, 0, 13, "DAILY LIQUIDITY", text_color=color.white)
+    table.cell(panel, 1, 13, "PDH: " + str.tostring(pdh, format.mintick) + "\nPDL: " + str.tostring(pdl, format.mintick), text_color=color.white, bgcolor=color.purple)
