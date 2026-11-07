@@ -1,0 +1,650 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © QUANT_TRADING - XAUUSD INSTITUTIONAL INTRADAY PRO STRATEGY v5.0 (High Performance Edition)
+// Specifically engineered for XAUUSD (Gold) 5M & 15M Intraday Trading
+//@version=6
+strategy("XAUUSD QUANT INTRADAY PRO | SMC + Liquidity Engine",
+     shorttitle="XAUUSD PRO v5",
+     overlay=true,
+     initial_capital=10000,
+     currency=currency.USD,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     pyramiding=0,
+     process_orders_on_close=true,
+     calc_on_every_tick=false,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.04,
+     slippage=2,
+     max_lines_count=500,
+     max_labels_count=500,
+     max_boxes_count=400)
+
+//====================================================
+// 1. INPUT SETTINGS & TRADER PARAMETERS
+//====================================================
+
+// --- 0. Strategy Profile & Operating Engine ---
+gProfile = "0. Strategy Operating Engine & Mode"
+setupModel = input.string("Both (Reversals + Trend Pullbacks)", "Setup Model",
+     options=["Both (Reversals + Trend Pullbacks)", "Liquidity Reversals Only (Sweeps)", "Trend Continuations Only (BOS)"], group=gProfile,
+     tooltip="Both: Delivers optimal 1-3 trades per day by capturing both session liquidity sweeps and strong trend pullbacks.")
+operatingTF = input.string("5M Intraday", "Target Operating Timeframe",
+     options=["5M Intraday", "15M Intraday", "Any Timeframe"], group=gProfile)
+allowedDirection = input.string("Both", "Trading Direction", options=["Both", "Long Only", "Short Only"], group=gProfile)
+
+// --- 1. Daily Risk Controls & Circuit Breakers ---
+gDaily = "1. Daily Risk Controls & Circuit Breakers (Mandatory Rules)"
+useDailyLimits = input.bool(true, "Enable Daily Limits & Circuit Breakers", group=gDaily)
+maxDailyTrades = input.int(3, "Max Trades Allowed Per Day", minval=1, maxval=10, group=gDaily,
+     tooltip="Direct constraint: Strict maximum of 3 trades per calendar day.")
+maxDailyLossUSD = input.float(250.0, "Daily Loss Circuit Breaker ($)", minval=10.0, step=10.0, group=gDaily,
+     tooltip="If daily net loss reaches -$250, all trading is halted immediately until the next trading day.")
+closeAtEOD = input.bool(true, "Force Close Positions at EOD (Zero Overnight Risk)", group=gDaily,
+     tooltip="Mandatory EOD rule: Squares off all positions before 17:00 UTC, avoiding overnight spread widening and swap fees.")
+eodSession = input.session("1630-1700:23456", "EOD Square-Off Window (UTC)", group=gDaily)
+
+// --- 2. Session Timing & Kill Zones (UTC) ---
+gSession = "2. Institutional Sessions & Kill Zones (UTC)"
+useSessionFilter = input.bool(true, "Trade Only During Active Kill Zones", group=gSession,
+     tooltip="Avoids dead Asian chop where Gold spreads are high and momentum is absent.")
+tradeSession = input.session("0700-1630:23456", "Active Trading Session (UTC)", group=gSession,
+     tooltip="07:00 - 16:30 UTC covers both London Open and New York Session / Overlap.")
+showAsiaRange = input.bool(true, "Plot Asian Session Range (00:00 - 06:00 UTC)", group=gSession)
+asiaSession = input.session("0000-0600:23456", "Asian Range Session (UTC)", group=gSession)
+
+// --- 3. Higher Timeframe (HTF) Trend Engine ---
+gTrend = "3. HTF Trend Alignment & Filter"
+useHtfFilter = input.bool(true, "Enable HTF Trend Filter for Trend Setups", group=gTrend,
+     tooltip="Trend pullbacks require alignment with HTF EMA. Reversals do NOT require HTF alignment because they trade exhaustion.")
+htfTimeframe = input.timeframe("15", "HTF Timeframe (15 for 5M, 60 for 15M)", group=gTrend)
+htfEmaFast = input.int(50, "HTF Fast EMA Length", minval=5, group=gTrend)
+htfEmaSlow = input.int(200, "HTF Slow EMA Length", minval=20, group=gTrend)
+
+// --- 4. SMC Liquidity Sweeps & Market Structure ---
+gSMC = "4. SMC Liquidity Sweeps & Structure"
+pivotStrength = input.int(5, "Swing Pivot Lookback Bars", minval=2, maxval=20, group=gSMC)
+sweepReclaimMaxBars = input.int(4, "Max Bars to Reclaim Swept Level", minval=1, maxval=10, group=gSMC,
+     tooltip="Gold institutional sweeps often wick or spend 1-3 bars outside the level before snapping back. This captures real multi-bar sweeps.")
+sweepMemoryBars = input.int(25, "Sweep Signal Validity (Bars)", minval=5, maxval=60, group=gSMC)
+showLiquidityLines = input.bool(true, "Plot Asian High/Low & PDH/PDL Lines", group=gSMC)
+showSweeps = input.bool(true, "Mark Liquidity Sweeps on Chart", group=gSMC)
+
+// --- 5. Volume & Momentum Confirmation ---
+gVol = "5. Volume & Momentum Confirmation"
+useVolumeFilter = input.bool(true, "Require Institutional Volume on Entry Candle", group=gVol)
+volLen = input.int(20, "Volume Moving Average Length", minval=5, group=gVol)
+volMultiplier = input.float(1.10, "Volume Spike Multiplier", minval=0.5, step=0.05, group=gVol)
+
+useRsiFilter = input.bool(true, "Enable RSI Momentum Filter", group=gVol)
+rsiLen = input.int(14, "RSI Length", minval=5, group=gVol)
+rsiLongMin = input.float(40.0, "Long RSI Minimum Level", minval=20, maxval=60, group=gVol)
+rsiShortMax = input.float(60.0, "Short RSI Maximum Level", minval=40, maxval=80, group=gVol)
+
+// --- 6. Gold Position Sizing & Contract Specs ---
+gSizing = "6. Gold (XAUUSD) Position Sizing & Contract Specs"
+sizingMode = input.string("Risk % of Equity (1R Compounding)", "Position Sizing Model",
+     options=["Risk % of Equity (1R Compounding)", "Daily Loss Budget (Split Across 3 Trades)", "Fixed Cash Risk ($)", "Fixed Lots/Units"], group=gSizing)
+riskPct = input.float(1.5, "Risk % Per Trade (1R)", minval=0.1, maxval=10.0, step=0.1, group=gSizing,
+     tooltip="Professional standard: 1.0% to 2.0% risk per trade.")
+fixedCashRisk = input.float(83.33, "Fixed Cash Risk ($ per trade)", minval=5.0, step=5.0, group=gSizing)
+fixedUnits = input.float(1.0, "Fixed Units / Contracts", minval=0.01, group=gSizing)
+
+contractType = input.string("CFD / Spot (1 Unit = 1 Troy Oz, $1/pt)", "Broker Gold Contract Spec",
+     options=["CFD / Spot (1 Unit = 1 Troy Oz, $1/pt)", "Standard Forex Lot (1 Lot = 100 Oz, $100/pt)", "Futures Contract (GC = 100 Oz)"], group=gSizing)
+minLotSize = input.float(0.01, "Minimum Allowed Order Size", minval=0.001, step=0.01, group=gSizing)
+lotStepSize = input.float(0.01, "Order Step Size", minval=0.001, step=0.01, group=gSizing)
+
+// --- 7. Stop Loss & Multi-Target Take Profit Engine ---
+gTargets = "7. Stop Loss & Profit Factor Optimization"
+atrLength = input.int(14, "ATR Length", minval=1, group=gTargets)
+atrSlBuffer = input.float(0.80, "Stop Loss ATR Buffer Multiplier", minval=0.2, step=0.05, group=gTargets)
+minSlPoints = input.float(2.0, "Minimum Stop Loss ($ Points on Gold)", minval=0.5, step=0.5, group=gTargets)
+
+exitMode = input.string("Multi-Target (Scale Out 50% at TP1)", "Exit Execution Model",
+     options=["Multi-Target (Scale Out 50% at TP1)", "Fixed Single Target (TP1 Only)", "Fixed Runner Target (TP2 Only)"], group=gTargets)
+tp1Multiple = input.float(2.0, "Target 1 (TP1) R-Multiple", minval=1.0, step=0.25, group=gTargets,
+     tooltip="Setting TP1 at 2.0R ensures half position covers entire risk even if runner hits breakeven!")
+tp2Multiple = input.float(3.5, "Target 2 (TP2) Runner R-Multiple", minval=1.5, step=0.25, group=gTargets)
+
+useAutoBreakeven = input.bool(true, "Auto-Move Stop to Breakeven at Trigger", group=gTargets)
+beTriggerR = input.float(1.2, "Breakeven Trigger (R-Multiple)", minval=0.5, step=0.1, group=gTargets)
+beOffsetPoints = input.float(0.20, "Breakeven Buffer ($0.20 covers commissions)", minval=0.0, step=0.05, group=gTargets)
+useTrailingStop = input.bool(true, "Enable ATR Trailing Stop on Runner (after TP1)", group=gTargets)
+trailAtrMult = input.float(1.75, "Trailing Stop ATR Multiplier", minval=0.5, step=0.25, group=gTargets)
+
+// --- 8. Date Range Filter ---
+gDate = "8. Backtest Date Range Filter"
+useDateFilter = input.bool(false, "Enable Custom Date Range", group=gDate)
+startDate = input.time(timestamp("2026-01-01 00:00 +0000"), "Start Date", group=gDate)
+endDate = input.time(timestamp("2026-11-30 23:59 +0000"), "End Date", group=gDate)
+
+// --- 9. Visual HUD & Dashboard ---
+gVisuals = "9. Chart Visuals & Dashboard HUD"
+showDashboard = input.bool(true, "Show Institutional Dashboard HUD", group=gVisuals)
+showTradeVisuals = input.bool(true, "Show Entry, SL, and TP Shaded Zones", group=gVisuals)
+showSignalLabels = input.bool(true, "Show Signal Cards on Entry Candles", group=gVisuals)
+
+//====================================================
+// 2. TIMEFRAME & TIME / SESSION ENGINE
+//====================================================
+
+is5M = timeframe.isminutes and timeframe.multiplier == 5
+is15M = timeframe.isminutes and timeframe.multiplier == 15
+currentTFName = is5M ? "5M" : is15M ? "15M" : (timeframe.period + "m")
+
+// Date filter
+withinDateRange = not useDateFilter or (time >= startDate and time <= endDate)
+
+// UTC Session checks
+inTradeSession = not useSessionFilter or not na(time(timeframe.period, tradeSession, "UTC"))
+inEodWindow = not na(time(timeframe.period, eodSession, "UTC"))
+inAsiaSession = not na(time(timeframe.period, asiaSession, "UTC"))
+
+// Daily reset trigger
+isNewDay = ta.change(time("D")) != 0
+
+//====================================================
+// 3. DAILY CIRCUIT BREAKER & LOSS TRACKER
+//====================================================
+
+var int dailyEntriesCount = 0
+var float dayStartBalance = 1000.0
+var float dailyNetPnL = 0.0
+
+if isNewDay
+    dailyEntriesCount := 0
+    dayStartBalance := strategy.equity
+    dailyNetPnL := 0.0
+else
+    dailyNetPnL := strategy.equity - dayStartBalance
+
+// Circuit breaker conditions
+dailyLossExceeded = useDailyLimits and (dailyNetPnL <= -maxDailyLossUSD)
+maxTradesReached = useDailyLimits and (dailyEntriesCount >= maxDailyTrades)
+circuitBreakerActive = dailyLossExceeded or maxTradesReached
+tradingAllowedToday = withinDateRange and not circuitBreakerActive and not inEodWindow and inTradeSession
+
+// Force close at End-Of-Day (EOD)
+if closeAtEOD and inEodWindow and strategy.position_size != 0
+    strategy.close_all(comment="EOD Close-Out")
+
+//====================================================
+// 4. NON-REPAINTING HIGHER TIMEFRAME (HTF) TREND
+//====================================================
+
+[htfC, htfFastVal, htfSlowVal] = request.security(
+     syminfo.tickerid,
+     htfTimeframe,
+     [close[1], ta.ema(close, htfEmaFast)[1], ta.ema(close, htfEmaSlow)[1]],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+htfTrendBullish = htfC > htfFastVal and htfFastVal >= htfSlowVal
+htfTrendBearish = htfC < htfFastVal and htfFastVal <= htfSlowVal
+
+//====================================================
+// 5. SMC LIQUIDITY ENGINE: ASIA RANGE & PREV DAY
+//====================================================
+
+[pdh, pdl] = request.security(
+     syminfo.tickerid, "D",
+     [high[1], low[1]],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+var float asiaHigh = na
+var float asiaLow = na
+var float currentAsiaHigh = na
+var float currentAsiaLow = na
+
+if isNewDay
+    currentAsiaHigh := na
+    currentAsiaLow := na
+
+if inAsiaSession
+    currentAsiaHigh := na(currentAsiaHigh) ? high : math.max(currentAsiaHigh, high)
+    currentAsiaLow := na(currentAsiaLow) ? low : math.min(currentAsiaLow, low)
+    asiaHigh := currentAsiaHigh
+    asiaLow := currentAsiaLow
+
+plot(showLiquidityLines ? pdh : na, "PDH", color=color.new(color.red, 30), style=plot.style_circles, linewidth=1)
+plot(showLiquidityLines ? pdl : na, "PDL", color=color.new(color.green, 30), style=plot.style_circles, linewidth=1)
+plot(showLiquidityLines and not inAsiaSession ? asiaHigh : na, "Asia High", color=color.new(color.maroon, 40), style=plot.style_linebr, linewidth=2)
+plot(showLiquidityLines and not inAsiaSession ? asiaLow : na, "Asia Low", color=color.new(color.teal, 40), style=plot.style_linebr, linewidth=2)
+
+//====================================================
+// 6. MULTI-BAR LIQUIDITY SWEEP DETECTION
+//====================================================
+
+atrVal = ta.atr(atrLength)
+
+swingHigh = ta.pivothigh(high, pivotStrength, pivotStrength)
+swingLow = ta.pivotlow(low, pivotStrength, pivotStrength)
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+if not na(swingLow)
+    lastSwingLow := swingLow
+
+// Multi-bar sweep logic:
+// Price breached level within sweepReclaimMaxBars, and current bar closes back inside with a strong close
+var int barBreachedPdl = na
+var int barBreachedAsiaLow = na
+var int barBreachedSwingLow = na
+
+var int barBreachedPdh = na
+var int barBreachedAsiaHigh = na
+var int barBreachedSwingHigh = na
+
+if not na(pdl) and low < pdl
+    barBreachedPdl := bar_index
+if not na(asiaLow) and not inAsiaSession and low < asiaLow
+    barBreachedAsiaLow := bar_index
+if not na(lastSwingLow) and low < lastSwingLow
+    barBreachedSwingLow := bar_index
+
+if not na(pdh) and high > pdh
+    barBreachedPdh := bar_index
+if not na(asiaHigh) and not inAsiaSession and high > asiaHigh
+    barBreachedAsiaHigh := bar_index
+if not na(lastSwingHigh) and high > lastSwingHigh
+    barBreachedSwingHigh := bar_index
+
+pdlSweepReclaim = not na(barBreachedPdl) and (bar_index - barBreachedPdl <= sweepReclaimMaxBars) and close > pdl and close > open
+asiaLowSweepReclaim = not na(barBreachedAsiaLow) and (bar_index - barBreachedAsiaLow <= sweepReclaimMaxBars) and close > asiaLow and close > open
+swingLowSweepReclaim = not na(barBreachedSwingLow) and (bar_index - barBreachedSwingLow <= sweepReclaimMaxBars) and close > lastSwingLow and close > open
+isBullSweep = pdlSweepReclaim or asiaLowSweepReclaim or swingLowSweepReclaim
+
+pdhSweepReclaim = not na(barBreachedPdh) and (bar_index - barBreachedPdh <= sweepReclaimMaxBars) and close < pdh and close < open
+asiaHighSweepReclaim = not na(barBreachedAsiaHigh) and (bar_index - barBreachedAsiaHigh <= sweepReclaimMaxBars) and close < asiaHigh and close < open
+swingHighSweepReclaim = not na(barBreachedSwingHigh) and (bar_index - barBreachedSwingHigh <= sweepReclaimMaxBars) and close < lastSwingHigh and close < open
+isBearSweep = pdhSweepReclaim or asiaHighSweepReclaim or swingHighSweepReclaim
+
+var int lastBullSweepBar = na
+var float lastBullSweepLow = na
+var int lastBearSweepBar = na
+var float lastBearSweepHigh = na
+
+if isBullSweep
+    lastBullSweepBar := bar_index
+    lastBullSweepLow := low
+    barBreachedPdl := na
+    barBreachedAsiaLow := na
+    barBreachedSwingLow := na
+
+if isBearSweep
+    lastBearSweepBar := bar_index
+    lastBearSweepHigh := high
+    barBreachedPdh := na
+    barBreachedAsiaHigh := na
+    barBreachedSwingHigh := na
+
+recentBullSweep = not na(lastBullSweepBar) and (bar_index - lastBullSweepBar <= sweepMemoryBars)
+recentBearSweep = not na(lastBearSweepBar) and (bar_index - lastBearSweepBar <= sweepMemoryBars)
+
+plotshape(showSweeps and isBullSweep, title="Bullish Sweep", style=shape.triangleup,
+     location=location.belowbar, color=color.aqua, size=size.tiny, text="SWEEP")
+plotshape(showSweeps and isBearSweep, title="Bearish Sweep", style=shape.triangledown,
+     location=location.abovebar, color=color.orange, size=size.tiny, text="SWEEP")
+
+//====================================================
+// 7. VOLUME, RSI & DISPLACEMENT CANDLES
+//====================================================
+
+volAvg = ta.sma(volume, volLen)
+volCondition = not useVolumeFilter or (volume >= volAvg * volMultiplier)
+
+rsiVal = ta.rsi(close, rsiLen)
+rsiBullOK = not useRsiFilter or (rsiVal >= rsiLongMin)
+rsiBearOK = not useRsiFilter or (rsiVal <= rsiShortMax)
+
+candleRange = high - low
+candleBody = math.abs(close - open)
+strongBullCandle = close > open and (candleRange > 0 ? candleBody / candleRange >= 0.45 : false)
+strongBearCandle = close < open and (candleRange > 0 ? candleBody / candleRange >= 0.45 : false)
+
+// Structure cross evaluated at root scope
+crossAboveSwingHigh = ta.crossover(close, lastSwingHigh)
+crossBelowSwingLow = ta.crossunder(close, lastSwingLow)
+
+mssLong = not na(lastSwingHigh) and crossAboveSwingHigh
+mssShort = not na(lastSwingLow) and crossBelowSwingLow
+
+var int lastMssLongBar = na
+var int lastMssShortBar = na
+
+if mssLong
+    lastMssLongBar := bar_index
+if mssShort
+    lastMssShortBar := bar_index
+
+recentMssLong = not na(lastMssLongBar) and (bar_index - lastMssLongBar <= 15)
+recentMssShort = not na(lastMssShortBar) and (bar_index - lastMssShortBar <= 15)
+
+//====================================================
+// 8. DUAL ENTRY SETUP GENERATION
+//====================================================
+
+dirLongOK = allowedDirection == "Both" or allowedDirection == "Long Only"
+dirShortOK = allowedDirection == "Both" or allowedDirection == "Short Only"
+
+// Setup 1: Liquidity Reversal (Judas Swing / Session Sweep)
+// Wicks swept liquidity, reclaimed level, strong displacement candle + volume + RSI
+setupReversalLong = recentBullSweep and strongBullCandle and volCondition and rsiBullOK and (recentMssLong or isBullSweep)
+setupReversalShort = recentBearSweep and strongBearCandle and volCondition and rsiBearOK and (recentMssShort or isBearSweep)
+
+// Setup 2: Trend Continuation (BOS Pullback / HTF Stack)
+// HTF trend aligned, price breaks local structure with volume, enters in trend direction
+setupTrendLong = (not useHtfFilter or htfTrendBullish) and strongBullCandle and volCondition and rsiBullOK and recentMssLong
+setupTrendShort = (not useHtfFilter or htfTrendBearish) and strongBearCandle and volCondition and rsiBearOK and recentMssShort
+
+qualifiesLong = switch setupModel
+    "Liquidity Reversals Only (Sweeps)" => setupReversalLong
+    "Trend Continuations Only (BOS)" => setupTrendLong
+    => setupReversalLong or setupTrendLong
+
+qualifiesShort = switch setupModel
+    "Liquidity Reversals Only (Sweeps)" => setupReversalShort
+    "Trend Continuations Only (BOS)" => setupTrendShort
+    => setupReversalShort or setupTrendShort
+
+longEntrySignal = (tradingAllowedToday and strategy.position_size == 0 and dirLongOK and qualifiesLong)
+shortEntrySignal = (tradingAllowedToday and strategy.position_size == 0 and dirShortOK and qualifiesShort)
+
+//====================================================
+// 9. DYNAMIC POSITION SIZING & EXECUTION
+//====================================================
+
+var float entryPrice = na
+var float stopLossPrice = na
+var float tp1Price = na
+var float tp2Price = na
+var float initialRiskDistance = na
+var float dynamicSL = na
+var float halfPositionQty = na
+var bool tp1Reached = false
+var bool beLocked = false
+
+multiplierPerPoint = switch contractType
+    "Standard Forex Lot (1 Lot = 100 Oz, $100/pt)" => 100.0
+    "Futures Contract (GC = 100 Oz)" => 100.0
+    => 1.0 // CFD / Spot 1 oz = 1 unit
+
+calcRiskAmount() =>
+    float cashRisk = 0.0
+    if sizingMode == "Risk % of Equity (1R Compounding)"
+        cashRisk := strategy.equity * (riskPct / 100.0)
+    else if sizingMode == "Daily Loss Budget (Split Across 3 Trades)"
+        cashRisk := maxDailyLossUSD / maxDailyTrades
+    else if sizingMode == "Fixed Cash Risk ($)"
+        cashRisk := fixedCashRisk
+    else
+        cashRisk := fixedUnits * atrVal * multiplierPerPoint
+    cashRisk
+
+// Execute Long Orders
+if longEntrySignal
+    entryPrice := close
+    rawSl = math.min(nz(lastBullSweepLow, low), low) - (atrVal * atrSlBuffer)
+    riskDist = entryPrice - rawSl
+    if riskDist < minSlPoints
+        rawSl := entryPrice - minSlPoints
+        riskDist := minSlPoints
+    
+    stopLossPrice := rawSl
+    initialRiskDistance := riskDist
+    
+    tp1Price := entryPrice + (initialRiskDistance * tp1Multiple)
+    tp2Price := entryPrice + (initialRiskDistance * tp2Multiple)
+    dynamicSL := stopLossPrice
+    tp1Reached := false
+    beLocked := false
+    dailyEntriesCount += 1
+
+    plannedCashRisk = calcRiskAmount()
+    pointDollarValue = initialRiskDistance * multiplierPerPoint
+    float calculatedQty = plannedCashRisk / pointDollarValue
+    
+    if calculatedQty < minLotSize
+        calculatedQty := minLotSize
+    else
+        calculatedQty := math.floor(calculatedQty / lotStepSize) * lotStepSize
+
+    float exitQty1 = (exitMode == "Multi-Target (Scale Out 50% at TP1)") ? math.max(minLotSize, math.floor((calculatedQty * 0.5) / lotStepSize) * lotStepSize) : calculatedQty
+    halfPositionQty := exitQty1
+
+    strategy.entry("LONG", strategy.long, qty=calculatedQty)
+
+    if exitMode == "Multi-Target (Scale Out 50% at TP1)"
+        strategy.exit("TP1_LONG", from_entry="LONG", qty=exitQty1, stop=dynamicSL, limit=tp1Price)
+        strategy.exit("TP2_LONG", from_entry="LONG", stop=dynamicSL, limit=tp2Price)
+    else if exitMode == "Fixed Single Target (TP1 Only)"
+        strategy.exit("TP1_ONLY_LONG", from_entry="LONG", stop=dynamicSL, limit=tp1Price)
+    else
+        strategy.exit("RUNNER_ONLY_LONG", from_entry="LONG", stop=dynamicSL, limit=tp2Price)
+
+    if showSignalLabels
+        label.new(bar_index, low - atrVal * 0.5,
+             "▲ XAUUSD LONG\n───────────────\n• Entry: " + str.tostring(entryPrice, "0.00") + "\n• SL:    " + str.tostring(stopLossPrice, "0.00") + "\n• TP1:   " + str.tostring(tp1Price, "0.00") + " (1:" + str.tostring(tp1Multiple, "0.0") + ")\n• TP2:   " + str.tostring(tp2Price, "0.00") + " (1:" + str.tostring(tp2Multiple, "0.0") + ")\n───────────────\n• Risk:  $" + str.tostring(plannedCashRisk, "0.00") + "\n• Size:  " + str.tostring(calculatedQty, "0.00") + " oz/lots",
+             color=color.teal, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    alert('{"action": "BUY", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(entryPrice, "0.00") + ', "sl": ' + str.tostring(stopLossPrice, "0.00") + ', "tp1": ' + str.tostring(tp1Price, "0.00") + ', "tp2": ' + str.tostring(tp2Price, "0.00") + ', "qty": ' + str.tostring(calculatedQty, "0.00") + '}', alert.freq_once_per_bar_close)
+
+// Execute Short Orders
+if shortEntrySignal
+    entryPrice := close
+    rawSl = math.max(nz(lastBearSweepHigh, high), high) + (atrVal * atrSlBuffer)
+    riskDist = rawSl - entryPrice
+    if riskDist < minSlPoints
+        rawSl := entryPrice + minSlPoints
+        riskDist := minSlPoints
+
+    stopLossPrice := rawSl
+    initialRiskDistance := riskDist
+
+    tp1Price := entryPrice - (initialRiskDistance * tp1Multiple)
+    tp2Price := entryPrice - (initialRiskDistance * tp2Multiple)
+    dynamicSL := stopLossPrice
+    tp1Reached := false
+    beLocked := false
+    dailyEntriesCount += 1
+
+    plannedCashRisk = calcRiskAmount()
+    pointDollarValue = initialRiskDistance * multiplierPerPoint
+    float calculatedQty = plannedCashRisk / pointDollarValue
+
+    if calculatedQty < minLotSize
+        calculatedQty := minLotSize
+    else
+        calculatedQty := math.floor(calculatedQty / lotStepSize) * lotStepSize
+
+    float exitQty1 = (exitMode == "Multi-Target (Scale Out 50% at TP1)") ? math.max(minLotSize, math.floor((calculatedQty * 0.5) / lotStepSize) * lotStepSize) : calculatedQty
+    halfPositionQty := exitQty1
+
+    strategy.entry("SHORT", strategy.short, qty=calculatedQty)
+
+    if exitMode == "Multi-Target (Scale Out 50% at TP1)"
+        strategy.exit("TP1_SHORT", from_entry="SHORT", qty=exitQty1, stop=dynamicSL, limit=tp1Price)
+        strategy.exit("TP2_SHORT", from_entry="SHORT", stop=dynamicSL, limit=tp2Price)
+    else if exitMode == "Fixed Single Target (TP1 Only)"
+        strategy.exit("TP1_ONLY_SHORT", from_entry="SHORT", stop=dynamicSL, limit=tp1Price)
+    else
+        strategy.exit("RUNNER_ONLY_SHORT", from_entry="SHORT", stop=dynamicSL, limit=tp2Price)
+
+    if showSignalLabels
+        label.new(bar_index, high + atrVal * 0.5,
+             "▼ XAUUSD SHORT\n───────────────\n• Entry: " + str.tostring(entryPrice, "0.00") + "\n• SL:    " + str.tostring(stopLossPrice, "0.00") + "\n• TP1:   " + str.tostring(tp1Price, "0.00") + " (1:" + str.tostring(tp1Multiple, "0.0") + ")\n• TP2:   " + str.tostring(tp2Price, "0.00") + " (1:" + str.tostring(tp2Multiple, "0.0") + ")\n───────────────\n• Risk:  $" + str.tostring(plannedCashRisk, "0.00") + "\n• Size:  " + str.tostring(calculatedQty, "0.00") + " oz/lots",
+             color=color.maroon, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    alert('{"action": "SELL", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(entryPrice, "0.00") + ', "sl": ' + str.tostring(stopLossPrice, "0.00") + ', "tp1": ' + str.tostring(tp1Price, "0.00") + ', "tp2": ' + str.tostring(tp2Price, "0.00") + ', "qty": ' + str.tostring(calculatedQty, "0.00") + '}', alert.freq_once_per_bar_close)
+
+//====================================================
+// 10. DYNAMIC BREAKEVEN & TRAILING STOP ENGINE
+//====================================================
+
+if strategy.position_size > 0
+    if exitMode == "Multi-Target (Scale Out 50% at TP1)" and not tp1Reached and (high >= tp1Price)
+        tp1Reached := true
+        dynamicSL := entryPrice + beOffsetPoints
+        beLocked := true
+        strategy.exit("TP2_LONG", from_entry="LONG", stop=dynamicSL, limit=tp2Price)
+    else if useAutoBreakeven and not beLocked and (high >= entryPrice + initialRiskDistance * beTriggerR)
+        dynamicSL := entryPrice + beOffsetPoints
+        beLocked := true
+        if exitMode == "Multi-Target (Scale Out 50% at TP1)" and not tp1Reached
+            strategy.exit("TP1_LONG", from_entry="LONG", qty=halfPositionQty, stop=dynamicSL, limit=tp1Price)
+            strategy.exit("TP2_LONG", from_entry="LONG", stop=dynamicSL, limit=tp2Price)
+        else if exitMode == "Multi-Target (Scale Out 50% at TP1)" and tp1Reached
+            strategy.exit("TP2_LONG", from_entry="LONG", stop=dynamicSL, limit=tp2Price)
+        else
+            strategy.exit("TP1_ONLY_LONG", from_entry="LONG", stop=dynamicSL, limit=tp1Price)
+
+    if useTrailingStop and (beLocked or tp1Reached)
+        trailPrice = high - (atrVal * trailAtrMult)
+        if trailPrice > dynamicSL
+            dynamicSL := trailPrice
+            if exitMode == "Multi-Target (Scale Out 50% at TP1)"
+                strategy.exit("TP2_LONG", from_entry="LONG", stop=dynamicSL, limit=tp2Price)
+            else
+                strategy.exit("RUNNER_ONLY_LONG", from_entry="LONG", stop=dynamicSL, limit=tp2Price)
+
+if strategy.position_size < 0
+    if exitMode == "Multi-Target (Scale Out 50% at TP1)" and not tp1Reached and (low <= tp1Price)
+        tp1Reached := true
+        dynamicSL := entryPrice - beOffsetPoints
+        beLocked := true
+        strategy.exit("TP2_SHORT", from_entry="SHORT", stop=dynamicSL, limit=tp2Price)
+    else if useAutoBreakeven and not beLocked and (low <= entryPrice - initialRiskDistance * beTriggerR)
+        dynamicSL := entryPrice - beOffsetPoints
+        beLocked := true
+        if exitMode == "Multi-Target (Scale Out 50% at TP1)" and not tp1Reached
+            strategy.exit("TP1_SHORT", from_entry="SHORT", qty=halfPositionQty, stop=dynamicSL, limit=tp1Price)
+            strategy.exit("TP2_SHORT", from_entry="SHORT", stop=dynamicSL, limit=tp2Price)
+        else if exitMode == "Multi-Target (Scale Out 50% at TP1)" and tp1Reached
+            strategy.exit("TP2_SHORT", from_entry="SHORT", stop=dynamicSL, limit=tp2Price)
+        else
+            strategy.exit("TP1_ONLY_SHORT", from_entry="SHORT", stop=dynamicSL, limit=tp1Price)
+
+    if useTrailingStop and (beLocked or tp1Reached)
+        trailPrice = low + (atrVal * trailAtrMult)
+        if trailPrice < dynamicSL
+            dynamicSL := trailPrice
+            if exitMode == "Multi-Target (Scale Out 50% at TP1)"
+                strategy.exit("TP2_SHORT", from_entry="SHORT", stop=dynamicSL, limit=tp2Price)
+            else
+                strategy.exit("RUNNER_ONLY_SHORT", from_entry="SHORT", stop=dynamicSL, limit=tp2Price)
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    dynamicSL := na
+    beLocked := false
+    tp1Reached := false
+
+//====================================================
+// 11. ON-CHART VISUAL SHADING & BRACKETS
+//====================================================
+
+inActiveTrade = strategy.position_size != 0
+
+pEntry = plot(inActiveTrade and showTradeVisuals ? entryPrice : na, "Entry Line", color=color.aqua, linewidth=2, style=plot.style_linebr)
+pSL = plot(inActiveTrade and showTradeVisuals ? dynamicSL : na, "SL Line", color=beLocked ? color.yellow : color.red, linewidth=2, style=plot.style_linebr)
+pTP2 = plot(inActiveTrade and showTradeVisuals ? tp2Price : na, "TP2 Runner", color=color.lime, linewidth=2, style=plot.style_linebr)
+pTP1 = plot(inActiveTrade and showTradeVisuals and exitMode == "Multi-Target (Scale Out 50% at TP1)" ? tp1Price : na, "TP1 Target", color=color.yellow, linewidth=1, style=plot.style_linebr)
+
+fill(pEntry, pTP2, color=inActiveTrade and showTradeVisuals ? color.new(color.green, 88) : na, title="Target Reward Zone")
+fill(pEntry, pSL, color=inActiveTrade and showTradeVisuals ? color.new(color.red, 88) : na, title="Risk Zone")
+
+//====================================================
+// 12. INSTITUTIONAL DASHBOARD HUD
+//====================================================
+
+var table hud = table.new(position.top_right, 2, 14,
+     bgcolor=color.new(color.black, 20),
+     border_width=1,
+     border_color=color.gray,
+     frame_color=color.gray,
+     frame_width=1)
+
+float openTradeR = na
+if inActiveTrade and not na(initialRiskDistance) and initialRiskDistance > 0
+    openTradeR := strategy.position_size > 0 ? (close - entryPrice) / initialRiskDistance : (entryPrice - close) / initialRiskDistance
+
+statusTradesStr = str.tostring(dailyEntriesCount) + " / " + str.tostring(maxDailyTrades)
+statusTradesColor = dailyEntriesCount >= maxDailyTrades ? color.orange : color.green
+
+statusPnlStr = "$" + str.tostring(dailyNetPnL, "+0.00")
+statusPnlColor = dailyNetPnL <= -maxDailyLossUSD ? color.red : dailyNetPnL > 0 ? color.green : color.gray
+
+circuitText = dailyLossExceeded ? "HALTED (MAX LOSS -$250)" : maxTradesReached ? "LOCKED (MAX 3 TRADES)" : inEodWindow ? "EOD SQUARE-OFF" : "ACTIVE"
+circuitColor = circuitBreakerActive ? color.red : inEodWindow ? color.purple : color.green
+
+sessionText = inTradeSession ? "LONDON/NY (ACTIVE)" : "OUTSIDE KILL ZONE"
+sessionColor = inTradeSession ? color.green : color.gray
+
+trendText = htfTrendBullish ? "BULLISH" : htfTrendBearish ? "BEARISH" : "NEUTRAL"
+trendColor = htfTrendBullish ? color.green : htfTrendBearish ? color.red : color.gray
+
+string posStatus = "FLAT (WAITING)"
+if strategy.position_size > 0
+    posStatus := "LONG (" + str.tostring(openTradeR, "+0.00") + "R)" + (beLocked ? " [BE]" : "")
+else if strategy.position_size < 0
+    posStatus := "SHORT (" + str.tostring(openTradeR, "+0.00") + "R)" + (beLocked ? " [BE]" : "")
+posColor = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+
+if barstate.islast and showDashboard
+    table.cell(hud, 0, 0, "XAUUSD QUANT PRO", bgcolor=color.navy, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 0, currentTFName + " INTRADAY", bgcolor=color.navy, text_color=color.yellow, text_size=size.small)
+
+    table.cell(hud, 0, 1, "CIRCUIT BREAKER", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 1, circuitText, text_color=color.white, bgcolor=circuitColor, text_size=size.small)
+
+    table.cell(hud, 0, 2, "DAILY TRADES", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 2, statusTradesStr, text_color=color.white, bgcolor=statusTradesColor, text_size=size.small)
+
+    table.cell(hud, 0, 3, "DAILY PnL (vs -$250)", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 3, statusPnlStr, text_color=color.white, bgcolor=statusPnlColor, text_size=size.small)
+
+    table.cell(hud, 0, 4, "EQUITY BALANCE", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 4, "$" + str.tostring(strategy.equity, "0.00"), text_color=color.white, bgcolor=color.blue, text_size=size.small)
+
+    table.cell(hud, 0, 5, "KILL ZONE SESSION", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 5, sessionText, text_color=color.white, bgcolor=sessionColor, text_size=size.small)
+
+    table.cell(hud, 0, 6, "HTF TREND (" + htfTimeframe + "m)", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 6, trendText, text_color=color.white, bgcolor=trendColor, text_size=size.small)
+
+    table.cell(hud, 0, 7, "LIVE POSITION", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 7, posStatus, text_color=color.white, bgcolor=posColor, text_size=size.small)
+
+    table.cell(hud, 0, 8, "• ENTRY PRICE", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 8, inActiveTrade ? str.tostring(entryPrice, "0.00") : "---", text_color=color.white, bgcolor=inActiveTrade ? color.blue : color.gray, text_size=size.small)
+
+    table.cell(hud, 0, 9, "• ACTIVE STOP LOSS", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 9, inActiveTrade ? (str.tostring(dynamicSL, "0.00") + (beLocked ? " [BE]" : "")) : "---", text_color=color.white, bgcolor=inActiveTrade ? (beLocked ? color.olive : color.maroon) : color.gray, text_size=size.small)
+
+    table.cell(hud, 0, 10, "• TP1 (2.0R) / TP2 (3.5R)", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 10, inActiveTrade ? (str.tostring(tp1Price, "0.00") + " | " + str.tostring(tp2Price, "0.00")) : "---", text_color=color.white, bgcolor=inActiveTrade ? color.green : color.gray, text_size=size.small)
+
+    table.cell(hud, 0, 11, "ASIAN RANGE", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 11, "H: " + str.tostring(asiaHigh, "0.00") + " | L: " + str.tostring(asiaLow, "0.00"), text_color=color.white, bgcolor=color.navy, text_size=size.small)
+
+    table.cell(hud, 0, 12, "PREV DAY HIGH/LOW", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 12, "PDH: " + str.tostring(pdh, "0.00") + "\nPDL: " + str.tostring(pdl, "0.00"), text_color=color.white, bgcolor=color.purple, text_size=size.small)
+
+    table.cell(hud, 0, 13, "CLOSE AT EOD", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 13, closeAtEOD ? "ENABLED (16:30 UTC)" : "DISABLED", text_color=color.white, bgcolor=closeAtEOD ? color.teal : color.red, text_size=size.small)
+
+//====================================================
+// 13. ALERTS FOR AUTOMATION & WEBHOOKS
+//====================================================
+
+alertcondition(longEntrySignal, title="XAUUSD BUY Alert",
+     message="XAUUSD BUY SIGNAL: Order Placed. Check TradingView Chart for SL and TP targets.")
+
+alertcondition(shortEntrySignal, title="XAUUSD SELL Alert",
+     message="XAUUSD SELL SIGNAL: Order Placed. Check TradingView Chart for SL and TP targets.")
+
+alertcondition(dailyLossExceeded, title="Daily Loss Circuit Breaker Hit",
+     message="HALT: Max Daily Loss Limit of -$250 Exceeded on XAUUSD. Trading suspended until tomorrow.")
