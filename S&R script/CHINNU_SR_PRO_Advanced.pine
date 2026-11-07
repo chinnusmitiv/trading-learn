@@ -1,0 +1,706 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CHINNU / RAJ TRADING - PRO ADVANCED SMC S&R STRATEGY v2.1
+//@version=6
+strategy("CHINNU S&R PRO ADVANCED | SMC + MTF + Trailing + Risk Engine",
+     shorttitle="CHINNU S&R PRO",
+     overlay=true,
+     initial_capital=10000,
+     currency=currency.USD,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     pyramiding=0,
+     process_orders_on_close=true,
+     calc_on_every_tick=false,
+     commission_type=strategy.commission.percent,
+     commission_value=0.02,
+     max_lines_count=400,
+     max_labels_count=400,
+     max_boxes_count=300)
+
+//====================================================
+// 1. INPUT SETTINGS
+//====================================================
+
+// --- Trade Direction & Market Regime ---
+gRegime = "0. Trade Direction & Regime"
+tradeDirection = input.string("Both", "Allowed Direction", options=["Both", "Long Only", "Short Only"], group=gRegime,
+     tooltip="Filter trade direction. Backtest shows Longs had 1.55 PF while Shorts suffered during HTF uptrend.")
+
+// --- Support & Resistance ---
+gSR = "1. Support & Resistance Zones"
+swingLen = input.int(5, "Swing Pivot Strength", minval=2, maxval=30, group=gSR)
+showLevels = input.bool(true, "Show Support / Resistance Zones", group=gSR)
+maxLevels = input.int(5, "Historical Levels Count", minval=1, maxval=20, group=gSR)
+zoneAtrMult = input.float(0.25, "S/R Zone Tolerance (ATR Multiplier)", minval=0.05, step=0.05, group=gSR,
+     tooltip="Defines S/R as a price zone rather than a single hairline, avoiding false cancellation on minor wick penetration.")
+
+// --- Timeframe & MTF Trend ---
+gTF = "2. Higher Timeframe Trend & Sessions"
+useTF = input.bool(true, "Restrict Entry Chart TF (15M / 30M)", group=gTF)
+useTrend = input.bool(true, "Enable HTF Trend Filter", group=gTF)
+trendTF = input.timeframe("60", "Higher Timeframe", group=gTF)
+trendMode = input.string("EMA Stack (50 > 200)", "HTF Trend Requirement", options=["EMA Stack (50 > 200)", "Price vs Fast EMA (50)", "Price vs Slow EMA (200)"], group=gTF)
+emaFastLen = input.int(50, "Fast EMA Length", minval=1, group=gTF)
+emaSlowLen = input.int(200, "Slow EMA Length", minval=1, group=gTF)
+showEMAs = input.bool(false, "Show HTF EMAs on Chart", group=gTF)
+
+useSession = input.bool(false, "Enable Session Filter (Kill Zones)", group=gTF)
+sessionTime = input.session("0700-1700:23456", "Active Kill Zone Session (UTC)", group=gTF,
+     tooltip="Filters low-liquidity overnight chop. Default corresponds to London + NY active hours.")
+
+// --- Smart Money Concepts (SMC) ---
+gSMC = "3. Smart Money Concepts (SMC)"
+smcMode = input.string("Breakout & Retest (BOS)", "SMC Setup Model",
+     options=["Breakout & Retest (BOS)", "Liquidity Sweep + Retest", "Either (All Clean Setups)"], group=gSMC)
+sweepLookback = input.int(25, "Liquidity Sweep Lookback Bars", minval=5, maxval=100, group=gSMC)
+showSMCMarks = input.bool(true, "Show Liquidity Sweep Markers", group=gSMC)
+
+// --- Volume Confirmation ---
+gVol = "4. Volume Confirmation"
+useVolume = input.bool(true, "Enable Volume Filter", group=gVol)
+volLen = input.int(20, "Volume Average Length", minval=1, group=gVol)
+volMult = input.float(1.15, "Volume Spike Multiplier", minval=0.1, step=0.05, group=gVol)
+volOnBreakOnly = input.bool(true, "Require Volume on Breakout Only (Allow Quiet Retest)", group=gVol,
+     tooltip="In SMC/Wyckoff, retests naturally have lower volume. Enabling this checks volume on the breakout, not punishing quiet pullbacks.")
+
+// --- RSI Confirmation ---
+gRSI = "5. RSI Confirmation"
+useRSI = input.bool(true, "Enable RSI Filter", group=gRSI)
+rsiLen = input.int(14, "RSI Length", minval=1, group=gRSI)
+rsiBuyLevel = input.float(50.0, "BUY RSI Minimum", minval=1, maxval=99, group=gRSI)
+rsiSellLevel = input.float(50.0, "SELL RSI Maximum", minval=1, maxval=99, group=gRSI)
+avoidExtremeRSI = input.bool(true, "Avoid Entering When RSI is Overextended", group=gRSI,
+     tooltip="Prevents buying when RSI > 75 or shorting when RSI < 25 (curbs bad shorts at market bottoms).")
+
+// --- Fibonacci Confluence ---
+gFib = "6. Fibonacci Confirmation"
+useFib = input.bool(false, "Require Fib Confluence (50% / 61.8%)", group=gFib)
+fibTolerance = input.float(0.3, "Fib Tolerance (ATR)", minval=0.05, step=0.05, group=gFib)
+showFib = input.bool(false, "Show Fibonacci Levels", group=gFib)
+
+// --- Entry Confirmation ---
+gEntry = "7. Entry Confirmation"
+maxWait = input.int(14, "Maximum Retest Waiting Bars", minval=1, group=gEntry)
+useCandleStrength = input.bool(true, "Require Strong Confirmation Candle", group=gEntry)
+minBodyPct = input.float(40.0, "Minimum Candle Body %", minval=1, maxval=100, group=gEntry)
+
+// --- Risk Management & Sizing (Institutional 1R Model) ---
+gRisk = "8. Risk Management & Position Sizing"
+sizingMode = input.string("Risk % of Equity (1R)", "Position Sizing Mode",
+     options=["Risk % of Equity (1R)", "Fixed Cash Risk ($)", "Fixed Quantity"], group=gRisk,
+     tooltip="Directly implements the Fixed Fractional 1R sizing from the repo's Risk Management Plan.")
+riskPct = input.float(1.0, "Risk % Per Trade (1R)", minval=0.1, maxval=10.0, step=0.1, group=gRisk)
+fixedRiskUSD = input.float(100.0, "Fixed Cash Risk ($)", minval=1.0, step=10.0, group=gRisk)
+fixedQty = input.float(1.0, "Fixed Quantity (Contracts/Shares)", minval=0.001, group=gRisk)
+
+rr = input.float(2.0, "Risk Reward Ratio (Target TP)", minval=1.0, step=0.25, group=gRisk)
+atrLen = input.int(14, "ATR Length", minval=1, group=gRisk)
+slType = input.string("Structural (Retest Swing + ATR)", "Stop Loss Placement",
+     options=["Structural (Retest Swing + ATR)", "Broken Level + ATR", "Pure ATR Multiple"], group=gRisk,
+     tooltip="Structural SL places stop below the retest wick. Prevents premature 1-2 bar stopouts.")
+atrBuffer = input.float(0.8, "SL ATR Buffer Multiplier", minval=0.1, step=0.1, group=gRisk)
+
+// --- Visual Entry / SL / TP Controls ---
+showTradeChannels = input.bool(true, "Show Shaded Risk & Reward Zones on Candles", group=gRisk,
+     tooltip="Shades a green profit zone to TP and a red risk zone to SL on all candles while trade is active.")
+showTradeLines = input.bool(true, "Show Entry / SL / TP Lines Across Candles", group=gRisk)
+showLabels = input.bool(true, "Show Detailed Entry / SL / TP Card on Signal Candle", group=gRisk)
+showHistoricalBoxes = input.bool(true, "Keep Historical Trade Brackets (Long/Short Tools)", group=gRisk,
+     tooltip="Draws permanent Long/Short position tool boxes for past trades so you can inspect historical SL/TP.")
+maxHistBoxes = input.int(15, "Max Historical Trade Brackets to Keep", minval=1, maxval=50, group=gRisk)
+
+// --- Breakeven & Trailing Stop Controls ---
+gExit = "9. Breakeven & Trailing Stop Engine"
+useBE = input.bool(true, "Enable Breakeven at Milestone", group=gExit,
+     tooltip="Moves stop-loss to entry price once trade reaches +1R in profit, eliminating large reversal losses.")
+beTriggerR = input.float(1.0, "Breakeven Trigger (R-Multiple)", minval=0.5, step=0.1, group=gExit)
+beOffsetTicks = input.int(2, "Breakeven Offset (Ticks above entry for fees)", minval=0, group=gExit)
+
+useTrailing = input.bool(false, "Enable ATR Trailing Stop", group=gExit)
+trailAtrMult = input.float(1.5, "Trailing Stop ATR Multiplier", minval=0.5, step=0.1, group=gExit)
+
+// --- Dashboard ---
+gDisplay = "10. Dashboard HUD"
+showDashboard = input.bool(true, "Show Dashboard HUD", group=gDisplay)
+
+//====================================================
+// 2. TIMEFRAME & SESSION VALIDATION
+//====================================================
+
+is15 = timeframe.isminutes and timeframe.multiplier == 15
+is30 = timeframe.isminutes and timeframe.multiplier == 30
+validTF = not useTF or is15 or is30
+tfName = is15 ? "15M" : is30 ? "30M" : timeframe.period
+
+// Session filter (checks if bar time is within active kill zone)
+inSession = not useSession or not na(time(timeframe.period, sessionTime, "UTC"))
+
+//====================================================
+// 3. HIGHER TIMEFRAME TREND ENGINE (NON-REPAINTING)
+//====================================================
+
+// Request HTF data referencing closed bar [1] to ensure ZERO repainting in live vs backtest
+[htfClose, htfFast, htfSlow] = request.security(
+     syminfo.tickerid,
+     trendTF,
+     [close[1], ta.ema(close, emaFastLen)[1], ta.ema(close, emaSlowLen)[1]],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+trendBull = false
+trendBear = false
+
+if trendMode == "EMA Stack (50 > 200)"
+    trendBull := htfClose > htfFast and htfFast > htfSlow
+    trendBear := htfClose < htfFast and htfFast < htfSlow
+else if trendMode == "Price vs Fast EMA (50)"
+    trendBull := htfClose > htfFast
+    trendBear := htfClose < htfFast
+else // "Price vs Slow EMA (200)"
+    trendBull := htfClose > htfSlow
+    trendBear := htfClose < htfSlow
+
+trendLongOK = not useTrend or trendBull
+trendShortOK = not useTrend or trendBear
+
+plot(showEMAs ? htfFast : na, "HTF EMA Fast", color=color.aqua, linewidth=2)
+plot(showEMAs ? htfSlow : na, "HTF EMA Slow", color=color.orange, linewidth=2)
+
+//====================================================
+// 4. SUPPORT & RESISTANCE ENGINE (ZONES)
+//====================================================
+
+atrValue = ta.atr(atrLen)
+zoneWidth = atrValue * zoneAtrMult
+
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+var float resistance = na
+var float support = na
+
+var box resBox = na
+var box supBox = na
+var array<box> oldResBoxes = array.new_box()
+var array<box> oldSupBoxes = array.new_box()
+
+if not na(ph)
+    resistance := ph
+    if showLevels
+        resBox := box.new(
+             left=bar_index - swingLen, top=ph + zoneWidth,
+             right=bar_index + 5, bottom=ph - zoneWidth,
+             border_color=color.new(color.red, 40),
+             bgcolor=color.new(color.red, 85))
+        array.push(oldResBoxes, resBox)
+        if array.size(oldResBoxes) > maxLevels
+            box.delete(array.shift(oldResBoxes))
+
+if not na(pl)
+    support := pl
+    if showLevels
+        supBox := box.new(
+             left=bar_index - swingLen, top=pl + zoneWidth,
+             right=bar_index + 5, bottom=pl - zoneWidth,
+             border_color=color.new(color.green, 40),
+             bgcolor=color.new(color.green, 85))
+        array.push(oldSupBoxes, supBox)
+        if array.size(oldSupBoxes) > maxLevels
+            box.delete(array.shift(oldSupBoxes))
+
+// Extend latest active boxes
+if not na(resBox)
+    box.set_right(resBox, bar_index + 3)
+if not na(supBox)
+    box.set_right(supBox, bar_index + 3)
+
+//====================================================
+// 5. SMC LIQUIDITY SWEEPS & STRUCTURE
+//====================================================
+
+// Bullish liquidity sweep: Wicks below support level and closes back inside/above the zone
+bullSweep = not na(support) and low < (support - zoneWidth) and close >= (support - zoneWidth)
+
+// Bearish liquidity sweep: Wicks above resistance level and closes back inside/below the zone
+bearSweep = not na(resistance) and high > (resistance + zoneWidth) and close <= (resistance + zoneWidth)
+
+var int lastBullSweepBar = na
+var int lastBearSweepBar = na
+
+if bullSweep
+    lastBullSweepBar := bar_index
+
+if bearSweep
+    lastBearSweepBar := bar_index
+
+bullSweepRecent = not na(lastBullSweepBar) and (bar_index - lastBullSweepBar <= sweepLookback)
+bearSweepRecent = not na(lastBearSweepBar) and (bar_index - lastBearSweepBar <= sweepLookback)
+
+// SMC model qualification
+smcLongQualified = switch smcMode
+    "Breakout & Retest (BOS)" => true
+    "Liquidity Sweep + Retest" => bullSweepRecent
+    => true // Either
+
+smcShortQualified = switch smcMode
+    "Breakout & Retest (BOS)" => true
+    "Liquidity Sweep + Retest" => bearSweepRecent
+    => true // Either
+
+plotshape(showSMCMarks and bullSweep, title="Bullish Liquidity Sweep (SSL)",
+     style=shape.circle, location=location.belowbar,
+     color=color.aqua, size=size.tiny, text="SSL SWEEP")
+
+plotshape(showSMCMarks and bearSweep, title="Bearish Liquidity Sweep (BSL)",
+     style=shape.circle, location=location.abovebar,
+     color=color.fuchsia, size=size.tiny, text="BSL SWEEP")
+
+//====================================================
+// 6. VOLUME CONFIRMATION
+//====================================================
+
+volAvg = ta.sma(volume, volLen)
+volSpike = not na(volAvg) and (volume >= volAvg * volMult)
+volumeBreakOK = not useVolume or volSpike
+
+//====================================================
+// 7. RSI CONFIRMATION
+//====================================================
+
+rsiValue = ta.rsi(close, rsiLen)
+
+rsiNotExtremeLong = not avoidExtremeRSI or rsiValue <= 75.0
+rsiNotExtremeShort = not avoidExtremeRSI or rsiValue >= 25.0
+
+rsiLongOK = not useRSI or (rsiValue >= rsiBuyLevel and rsiNotExtremeLong)
+rsiShortOK = not useRSI or (rsiValue <= rsiSellLevel and rsiNotExtremeShort)
+
+//====================================================
+// 8. FIBONACCI CONFLUENCE
+//====================================================
+
+swingRange = not na(resistance) and not na(support) ? resistance - support : na
+bullFib50 = not na(swingRange) and swingRange > 0 ? resistance - swingRange * 0.50 : na
+bullFib618 = not na(swingRange) and swingRange > 0 ? resistance - swingRange * 0.618 : na
+bearFib50 = not na(swingRange) and swingRange > 0 ? support + swingRange * 0.50 : na
+bearFib618 = not na(swingRange) and swingRange > 0 ? support + swingRange * 0.618 : na
+
+fibLongOK = not useFib or (
+     not na(bullFib50) and
+     (math.abs(close - bullFib50) <= atrValue * fibTolerance or
+      math.abs(close - bullFib618) <= atrValue * fibTolerance))
+
+fibShortOK = not useFib or (
+     not na(bearFib50) and
+     (math.abs(close - bearFib50) <= atrValue * fibTolerance or
+      math.abs(close - bearFib618) <= atrValue * fibTolerance))
+
+plot(showFib ? bullFib50 : na, "Bull Fib 0.50", color=color.yellow, style=plot.style_linebr)
+plot(showFib ? bullFib618 : na, "Bull Fib 0.618", color=color.orange, style=plot.style_linebr)
+plot(showFib ? bearFib50 : na, "Bear Fib 0.50", color=color.yellow, style=plot.style_linebr)
+plot(showFib ? bearFib618 : na, "Bear Fib 0.618", color=color.orange, style=plot.style_linebr)
+
+//====================================================
+// 9. CANDLE STRENGTH
+//====================================================
+
+candleRange = high - low
+bodyPercent = candleRange > 0 ? math.abs(close - open) / candleRange * 100 : 0
+bullCandleOK = not useCandleStrength or (close > open and bodyPercent >= minBodyPct)
+bearCandleOK = not useCandleStrength or (close < open and bodyPercent >= minBodyPct)
+
+// Direction filter
+dirLongOK = tradeDirection == "Both" or tradeDirection == "Long Only"
+dirShortOK = tradeDirection == "Both" or tradeDirection == "Short Only"
+
+//====================================================
+// 10. ROBUST BREAKOUT & RETEST STATE MACHINE
+//====================================================
+
+var int state = 0
+var float brokenLevel = na
+var float retestHigh = na
+var float retestLow = na
+var int setupBar = na
+var float breakoutVol = na
+
+bullBreakCross = not na(resistance) and ta.crossover(close, resistance)
+bearBreakCross = not na(support) and ta.crossunder(close, support)
+
+// Trigger breakout
+buyBreak = validTF and inSession and dirLongOK and state == 0 and strategy.position_size == 0 and bullBreakCross and (not volOnBreakOnly or volumeBreakOK)
+sellBreak = validTF and inSession and dirShortOK and state == 0 and strategy.position_size == 0 and bearBreakCross and (not volOnBreakOnly or volumeBreakOK)
+
+if buyBreak
+    state := 1
+    brokenLevel := resistance
+    retestHigh := high
+    retestLow := low
+    setupBar := bar_index
+    breakoutVol := volume
+
+if sellBreak
+    state := -1
+    brokenLevel := support
+    retestHigh := high
+    retestLow := low
+    setupBar := bar_index
+    breakoutVol := volume
+
+// Timeout stale setups
+if state != 0 and not na(setupBar) and (bar_index - setupBar > maxWait)
+    state := 0
+    brokenLevel := na
+    retestHigh := na
+    retestLow := na
+    setupBar := na
+
+// BULLISH RETEST (State 1 -> 2)
+if state == 1
+    if close < (brokenLevel - zoneWidth * 1.5)
+        state := 0
+        brokenLevel := na
+        setupBar := na
+    else if low <= (brokenLevel + zoneWidth) and close >= (brokenLevel - zoneWidth)
+        retestHigh := na(retestHigh) ? high : math.max(retestHigh, high)
+        retestLow := na(retestLow) ? low : math.min(retestLow, low)
+        state := 2
+
+// Update retest low while in state 2
+if state == 2
+    retestLow := na(retestLow) ? low : math.min(retestLow, low)
+    if close < (brokenLevel - zoneWidth * 1.5)
+        state := 0
+        setupBar := na
+
+// BEARISH RETEST (State -1 -> -2)
+if state == -1
+    if close > (brokenLevel + zoneWidth * 1.5)
+        state := 0
+        brokenLevel := na
+        setupBar := na
+    else if high >= (brokenLevel - zoneWidth) and close <= (brokenLevel + zoneWidth)
+        retestHigh := na(retestHigh) ? high : math.max(retestHigh, high)
+        retestLow := na(retestLow) ? low : math.min(retestLow, low)
+        state := -2
+
+// Update retest high while in state -2
+if state == -2
+    retestHigh := na(retestHigh) ? high : math.max(retestHigh, high)
+    if close > (brokenLevel + zoneWidth * 1.5)
+        state := 0
+        setupBar := na
+
+//====================================================
+// 11. CONFIRMATION TRIGGERS & FINAL FILTERS
+//====================================================
+
+volRetestOK = not useVolume or volOnBreakOnly or volumeBreakOK
+
+longFilters = validTF and inSession and dirLongOK and trendLongOK and smcLongQualified and volRetestOK and rsiLongOK and fibLongOK and bullCandleOK
+shortFilters = validTF and inSession and dirShortOK and trendShortOK and smcShortQualified and volRetestOK and rsiShortOK and fibShortOK and bearCandleOK
+
+buyTrigger = state == 2 and close > brokenLevel and close > retestHigh and close[1] <= retestHigh
+sellTrigger = state == -2 and close < brokenLevel and close < retestLow and close[1] >= retestLow
+
+buySignal = buyTrigger and longFilters
+sellSignal = sellTrigger and shortFilters
+
+if buyTrigger or sellTrigger
+    state := 0
+    setupBar := na
+
+//====================================================
+// 12. TRADE LEVELS, POSITION SIZING & VISUALS
+//====================================================
+
+var float entryPrice = na
+var float stopLoss = na
+var float takeProfit = na
+var float initialRisk = na
+var float activeSL = na
+var bool beActivated = false
+var int entryBar = na
+
+// Historical trade boxes array
+var array<box> histBoxes = array.new_box()
+var box activeTpBox = na
+var box activeSlBox = na
+
+// Calculate Long Trade Size & Orders
+if buySignal and strategy.position_size == 0
+    entryPrice := close
+    entryBar := bar_index
+    
+    stopLoss := switch slType
+        "Structural (Retest Swing + ATR)" => math.min(brokenLevel, nz(retestLow, low)) - atrValue * atrBuffer
+        "Broken Level + ATR" => brokenLevel - atrValue * atrBuffer
+        => entryPrice - atrValue * atrBuffer * 2.0
+    
+    initialRisk := entryPrice - stopLoss
+    
+    if initialRisk > syminfo.mintick
+        takeProfit := entryPrice + initialRisk * rr
+        activeSL := stopLoss
+        beActivated := false
+
+        float tradeQty = na
+        if sizingMode == "Risk % of Equity (1R)"
+            riskDollars = strategy.equity * (riskPct / 100.0)
+            tradeQty := riskDollars / initialRisk
+        else if sizingMode == "Fixed Cash Risk ($)"
+            tradeQty := fixedRiskUSD / initialRisk
+        else
+            tradeQty := fixedQty
+
+        if syminfo.type == "crypto"
+            tradeQty := math.max(syminfo.mincontract, math.round(tradeQty, 3))
+        else
+            tradeQty := math.max(1, math.floor(tradeQty))
+
+        strategy.entry("BUY", strategy.long, qty=tradeQty)
+        strategy.exit("BUY EXIT", from_entry="BUY", stop=activeSL, limit=takeProfit)
+
+        // Historical / Live Visual Trade Bracket Box
+        if showHistoricalBoxes
+            activeTpBox := box.new(left=bar_index, top=takeProfit, right=bar_index + 1, bottom=entryPrice,
+                 border_color=color.new(color.green, 20), bgcolor=color.new(color.green, 88), border_width=1)
+            activeSlBox := box.new(left=bar_index, top=entryPrice, right=bar_index + 1, bottom=stopLoss,
+                 border_color=color.new(color.red, 20), bgcolor=color.new(color.red, 88), border_width=1)
+            array.push(histBoxes, activeTpBox)
+            array.push(histBoxes, activeSlBox)
+            if array.size(histBoxes) > maxHistBoxes * 2
+                box.delete(array.shift(histBoxes))
+                box.delete(array.shift(histBoxes))
+
+        // Prominent Entry Candle Card
+        if showLabels
+            label.new(
+                 bar_index, low,
+                 "▲ BUY ENTRY (" + tfName + ")" +
+                 "\n────────────────────" +
+                 "\n• ENTRY: " + str.tostring(entryPrice, format.mintick) +
+                 "\n• SL:    " + str.tostring(stopLoss, format.mintick) +
+                 "\n• TP:    " + str.tostring(takeProfit, format.mintick) +
+                 "\n────────────────────" +
+                 "\n• Risk:  $" + str.tostring(initialRisk * tradeQty, "#.##") + " (1R)" +
+                 "\n• RR:    1:" + str.tostring(rr, "#.#") +
+                 "\n• Size:  " + str.tostring(tradeQty, "#.##") + " units",
+                 yloc=yloc.belowbar,
+                 style=label.style_label_up,
+                 color=color.new(color.green, 10),
+                 textcolor=color.white,
+                 size=size.normal)
+
+// Calculate Short Trade Size & Orders
+if sellSignal and strategy.position_size == 0
+    entryPrice := close
+    entryBar := bar_index
+    
+    stopLoss := switch slType
+        "Structural (Retest Swing + ATR)" => math.max(brokenLevel, nz(retestHigh, high)) + atrValue * atrBuffer
+        "Broken Level + ATR" => brokenLevel + atrValue * atrBuffer
+        => entryPrice + atrValue * atrBuffer * 2.0
+    
+    initialRisk := stopLoss - entryPrice
+    
+    if initialRisk > syminfo.mintick
+        takeProfit := entryPrice - initialRisk * rr
+        activeSL := stopLoss
+        beActivated := false
+
+        float tradeQty = na
+        if sizingMode == "Risk % of Equity (1R)"
+            riskDollars = strategy.equity * (riskPct / 100.0)
+            tradeQty := riskDollars / initialRisk
+        else if sizingMode == "Fixed Cash Risk ($)"
+            tradeQty := fixedRiskUSD / initialRisk
+        else
+            tradeQty := fixedQty
+
+        if syminfo.type == "crypto"
+            tradeQty := math.max(syminfo.mincontract, math.round(tradeQty, 3))
+        else
+            tradeQty := math.max(1, math.floor(tradeQty))
+
+        strategy.entry("SELL", strategy.short, qty=tradeQty)
+        strategy.exit("SELL EXIT", from_entry="SELL", stop=activeSL, limit=takeProfit)
+
+        // Historical / Live Visual Trade Bracket Box
+        if showHistoricalBoxes
+            activeTpBox := box.new(left=bar_index, top=entryPrice, right=bar_index + 1, bottom=takeProfit,
+                 border_color=color.new(color.green, 20), bgcolor=color.new(color.green, 88), border_width=1)
+            activeSlBox := box.new(left=bar_index, top=stopLoss, right=bar_index + 1, bottom=entryPrice,
+                 border_color=color.new(color.red, 20), bgcolor=color.new(color.red, 88), border_width=1)
+            array.push(histBoxes, activeTpBox)
+            array.push(histBoxes, activeSlBox)
+            if array.size(histBoxes) > maxHistBoxes * 2
+                box.delete(array.shift(histBoxes))
+                box.delete(array.shift(histBoxes))
+
+        // Prominent Entry Candle Card
+        if showLabels
+            label.new(
+                 bar_index, high,
+                 "▼ SELL ENTRY (" + tfName + ")" +
+                 "\n────────────────────" +
+                 "\n• ENTRY: " + str.tostring(entryPrice, format.mintick) +
+                 "\n• SL:    " + str.tostring(stopLoss, format.mintick) +
+                 "\n• TP:    " + str.tostring(takeProfit, format.mintick) +
+                 "\n────────────────────" +
+                 "\n• Risk:  $" + str.tostring(initialRisk * tradeQty, "#.##") + " (1R)" +
+                 "\n• RR:    1:" + str.tostring(rr, "#.#") +
+                 "\n• Size:  " + str.tostring(tradeQty, "#.##") + " units",
+                 yloc=yloc.abovebar,
+                 style=label.style_label_down,
+                 color=color.new(color.red, 10),
+                 textcolor=color.white,
+                 size=size.normal)
+
+// Extend active trade bracket boxes across open trade candles
+if strategy.position_size != 0
+    if not na(activeTpBox)
+        box.set_right(activeTpBox, bar_index)
+    if not na(activeSlBox)
+        box.set_right(activeSlBox, bar_index)
+
+//====================================================
+// 13. DYNAMIC BREAKEVEN & TRAILING STOP ENGINE
+//====================================================
+
+if strategy.position_size > 0
+    if useBE and not beActivated and (high >= entryPrice + initialRisk * beTriggerR)
+        activeSL := entryPrice + beOffsetTicks * syminfo.mintick
+        beActivated := true
+        strategy.exit("BUY EXIT", from_entry="BUY", stop=activeSL, limit=takeProfit)
+
+    if useTrailing and beActivated
+        trailStopPrice = high - atrValue * trailAtrMult
+        if trailStopPrice > activeSL
+            activeSL := trailStopPrice
+            strategy.exit("BUY EXIT", from_entry="BUY", stop=activeSL, limit=takeProfit)
+
+if strategy.position_size < 0
+    if useBE and not beActivated and (low <= entryPrice - initialRisk * beTriggerR)
+        activeSL := entryPrice - beOffsetTicks * syminfo.mintick
+        beActivated := true
+        strategy.exit("SELL EXIT", from_entry="SELL", stop=activeSL, limit=takeProfit)
+
+    if useTrailing and beActivated
+        trailStopPrice = low + atrValue * trailAtrMult
+        if trailStopPrice < activeSL
+            activeSL := trailStopPrice
+            strategy.exit("SELL EXIT", from_entry="SELL", stop=activeSL, limit=takeProfit)
+
+// Position close event: reset active tracking
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    activeSL := na
+    beActivated := false
+    activeTpBox := na
+    activeSlBox := na
+
+//====================================================
+// 14. ON-CANDLE TRADE LEVELS & VISUAL CHANNELS
+//====================================================
+
+inTrade = strategy.position_size != 0
+
+// Continuous plots spanning every candle while in position
+plotEntry = inTrade and showTradeLines ? entryPrice : na
+plotSL = inTrade and showTradeLines ? activeSL : na
+plotTP = inTrade and showTradeLines ? takeProfit : na
+
+pEntry = plot(plotEntry, "Active Trade Entry Price", color=color.aqua, linewidth=2, style=plot.style_linebr)
+pSL = plot(plotSL, "Active Trade Stop Loss (SL)", color=beActivated ? color.yellow : color.red, linewidth=2, style=plot.style_linebr)
+pTP = plot(plotTP, "Active Trade Take Profit (TP)", color=color.lime, linewidth=2, style=plot.style_linebr)
+
+// Shaded Green Profit zone & Red Risk zone directly on candles
+fill(pEntry, pTP, color=inTrade and showTradeChannels ? color.new(color.green, 86) : na, title="Target Profit Zone (TP)")
+fill(pEntry, pSL, color=inTrade and showTradeChannels ? color.new(color.red, 86) : na, title="Risk Zone (SL)")
+
+//====================================================
+// 15. ALERTS
+//====================================================
+
+alertcondition(buySignal, title="CHINNU S&R BUY",
+     message="CHINNU S&R PRO: BUY Signal Confirmed on {{ticker}} {{interval}} at {{close}}")
+
+alertcondition(sellSignal, title="CHINNU S&R SELL",
+     message="CHINNU S&R PRO: SELL Signal Confirmed on {{ticker}} {{interval}} at {{close}}")
+
+//====================================================
+// 16. ENHANCED DASHBOARD HUD
+//====================================================
+
+var table panel = table.new(position.top_right, 2, 13,
+     border_width=1, frame_color=color.gray, border_color=color.gray)
+
+stateText = state == 0 ? "WAITING FOR SETUP" :
+     state == 1 ? "BULLISH RETEST ZONE" :
+     state == 2 ? "BULLISH CONFIRMING" :
+     state == -1 ? "BEARISH RETEST ZONE" : "BEARISH CONFIRMING"
+
+stateColor = state == 0 ? color.gray : state > 0 ? color.green : color.red
+trendText = trendBull ? "BULLISH" : trendBear ? "BEARISH" : "NEUTRAL"
+trendColor = trendBull ? color.green : trendBear ? color.red : color.gray
+smcText = smcMode == "Breakout & Retest (BOS)" ? "BOS MODE" : (bullSweepRecent ? "BULL SWEEP" : bearSweepRecent ? "BEAR SWEEP" : "WAITING")
+volText = volumeBreakOK ? "PASS" : "WAITING"
+rsiText = "RSI " + str.tostring(rsiValue, "#.0")
+sessionText = inSession ? "ACTIVE" : "OUTSIDE"
+
+// Current Position & Open R-Multiple
+float openR = na
+if strategy.position_size > 0 and not na(initialRisk) and initialRisk > 0
+    openR := (close - entryPrice) / initialRisk
+else if strategy.position_size < 0 and not na(initialRisk) and initialRisk > 0
+    openR := (entryPrice - close) / initialRisk
+
+posText = strategy.position_size > 0 ? ("LONG " + (beActivated ? "[BE LOCKED]" : "") + " (" + str.tostring(openR, "+#.##") + "R)") :
+          strategy.position_size < 0 ? ("SHORT " + (beActivated ? "[BE LOCKED]" : "") + " (" + str.tostring(openR, "+#.##") + "R)") : "FLAT"
+
+posColor = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+
+// Live prices for HUD
+liveEntryStr = inTrade ? str.tostring(entryPrice, format.mintick) : "---"
+liveSLStr = inTrade ? (str.tostring(activeSL, format.mintick) + (beActivated ? " [BE]" : "")) : "---"
+liveTPStr = inTrade ? (str.tostring(takeProfit, format.mintick) + " (1:" + str.tostring(rr, "#.#") + ")") : "---"
+
+if barstate.islast and showDashboard
+    table.cell(panel, 0, 0, "CHINNU S&R PRO", bgcolor=color.navy, text_color=color.white)
+    table.cell(panel, 1, 0, tfName + " | " + tradeDirection, bgcolor=color.navy, text_color=color.white)
+
+    table.cell(panel, 0, 1, "TIMEFRAME", text_color=color.white, bgcolor=color.gray)
+    table.cell(panel, 1, 1, validTF ? "VALID" : "INVALID", text_color=color.white, bgcolor=validTF ? color.green : color.red)
+
+    table.cell(panel, 0, 2, "HTF TREND", text_color=color.white)
+    table.cell(panel, 1, 2, trendText, text_color=color.white, bgcolor=trendColor)
+
+    table.cell(panel, 0, 3, "SMC STATUS", text_color=color.white)
+    table.cell(panel, 1, 3, smcText, text_color=color.white, bgcolor=color.teal)
+
+    table.cell(panel, 0, 4, "VOLUME", text_color=color.white)
+    table.cell(panel, 1, 4, volText, text_color=color.white, bgcolor=volumeBreakOK ? color.green : color.gray)
+
+    table.cell(panel, 0, 5, "RSI MOMENTUM", text_color=color.white)
+    table.cell(panel, 1, 5, rsiText, text_color=color.white, bgcolor=rsiLongOK ? color.green : rsiShortOK ? color.red : color.gray)
+
+    table.cell(panel, 0, 6, "SESSION", text_color=color.white)
+    table.cell(panel, 1, 6, sessionText, text_color=color.white, bgcolor=inSession ? color.green : color.gray)
+
+    table.cell(panel, 0, 7, "SETUP STATE", text_color=color.white)
+    table.cell(panel, 1, 7, stateText, text_color=color.white, bgcolor=stateColor)
+
+    table.cell(panel, 0, 8, "LIVE POSITION", text_color=color.white)
+    table.cell(panel, 1, 8, posText, text_color=color.white, bgcolor=posColor)
+
+    table.cell(panel, 0, 9, "• ENTRY PRICE", text_color=color.white)
+    table.cell(panel, 1, 9, liveEntryStr, text_color=color.white, bgcolor=inTrade ? color.blue : color.gray)
+
+    table.cell(panel, 0, 10, "• STOP LOSS (SL)", text_color=color.white)
+    table.cell(panel, 1, 10, liveSLStr, text_color=color.white, bgcolor=inTrade ? (beActivated ? color.olive : color.maroon) : color.gray)
+
+    table.cell(panel, 0, 11, "• TAKE PROFIT (TP)", text_color=color.white)
+    table.cell(panel, 1, 11, liveTPStr, text_color=color.white, bgcolor=inTrade ? color.green : color.gray)
+
+    table.cell(panel, 0, 12, "SIZING MODEL", text_color=color.white)
+    table.cell(panel, 1, 12, sizingMode == "Risk % of Equity (1R)" ? (str.tostring(riskPct) + "% (1R)") : sizingMode, text_color=color.white, bgcolor=color.navy)
