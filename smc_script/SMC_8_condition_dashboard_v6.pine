@@ -1,0 +1,440 @@
+//@version=6
+indicator("SMC 8-Condition Dashboard [v6]", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+// ═══════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════
+pivotLen    = input.int(5, "Pivot Left/Right Bars", minval=1, maxval=20)
+htfTF       = input.timeframe("D", "HTF for Bias")
+lTF         = input.timeframe("5", "LTF for Confirmation")
+showAll     = input.bool(true, "Show All Visuals")
+showDash    = input.bool(true, "Show Dashboard")
+dashPos     = input.string("Top Right", "Dashboard Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"])
+
+// Killzone times (New York)
+kzLondon    = input.bool(true, "Use London Killzone (07:00-10:00 NY)")
+kzNY        = input.bool(true, "Use NY Killzone (13:00-16:00 NY)")
+
+// Displacement threshold (ATR multiple)
+dispATR     = input.float(1.5, "Displacement ATR Multiplier", minval=0.5, step=0.1)
+atrLen      = input.int(14, "ATR Length")
+
+// ═══════════════════════════════════════════
+// ATR
+// ═══════════════════════════════════════════
+atrVal = ta.atr(atrLen)
+
+// ═══════════════════════════════════════════
+// 1. SWING PIVOTS & MARKET STRUCTURE
+// ═══════════════════════════════════════════
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastSwingHigh  = na
+var float lastSwingLow   = na
+var float prevSwingHigh  = na
+var float prevSwingLow   = na
+var int   lastSwingHighBar = 0
+var int   lastSwingLowBar  = 0
+
+if not na(ph)
+    prevSwingHigh := lastSwingHigh
+    lastSwingHigh := ph
+    lastSwingHighBar := bar_index - pivotLen
+
+if not na(pl)
+    prevSwingLow := lastSwingLow
+    lastSwingLow := pl
+    lastSwingLowBar := bar_index - pivotLen
+
+// Track structure direction
+var int structureDir = 0  // 1 = bullish, -1 = bearish, 0 = unknown
+var string lastStructureLabel = "None"
+
+// HH/HL = bullish, LH/LL = bearish
+isHH = not na(ph) and ph > prevSwingHigh
+isLH = not na(ph) and ph < prevSwingHigh
+isHL = not na(pl) and pl > prevSwingLow
+isLL = not na(pl) and pl < prevSwingLow
+
+if isHH or isHL
+    structureDir := 1
+    lastStructureLabel := isHH ? "HH" : "HL"
+if isLH or isLL
+    structureDir := -1
+    lastStructureLabel := isLH ? "LH" : "LL"
+
+// ═══════════════════════════════════════════
+// 2. BOS & CHoCH (Body Close)
+// ═══════════════════════════════════════════
+var int lastBOSBar = -999
+var int lastCHoCHBar = -999
+var string lastBOSType = ""
+
+// BOS: close beyond last swing in trend direction
+bosBull  = structureDir == 1 and not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+bosBear  = structureDir == -1 and not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+
+// CHoCH: close against trend
+chochBull = structureDir == -1 and not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+chochBear = structureDir == 1 and not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+
+if bosBull or bosBear
+    lastBOSBar := bar_index
+    lastBOSType := bosBull ? "Bullish BOS" : "Bearish BOS"
+if chochBull or chochBear
+    lastCHoCHBar := bar_index
+    lastBOSType := chochBull ? "Bullish CHoCH" : "Bearish CHoCH"
+
+recentStructure = (bar_index - lastBOSBar < 20) or (bar_index - lastCHoCHBar < 20)
+
+// ═══════════════════════════════════════════
+// 3. FAIR VALUE GAP (FVG)
+// ═══════════════════════════════════════════
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+var float lastBullFVGHigh = na
+var float lastBullFVGLow  = na
+var float lastBearFVGHigh = na
+var float lastBearFVGLow  = na
+var int   lastBullFVGBar  = 0
+var int   lastBearFVGBar  = 0
+var bool  bullFVGMitigated = false
+var bool  bearFVGMitigated = false
+
+if bullFVG
+    lastBullFVGHigh := high[2]
+    lastBullFVGLow  := low
+    lastBullFVGBar  := bar_index
+    bullFVGMitigated := false
+
+if bearFVG
+    lastBearFVGHigh := high
+    lastBearFVGLow  := low[2]
+    lastBearFVGBar  := bar_index
+    bearFVGMitigated := false
+
+// Check if FVG is still active (not mitigated)
+if not na(lastBullFVGHigh) and low < lastBullFVGLow
+    bullFVGMitigated := true
+if not na(lastBearFVGHigh) and high > lastBearFVGLow
+    bearFVGMitigated := true
+
+// Price currently in FVG zone
+inBullFVG = not na(lastBullFVGHigh) and not bullFVGMitigated and close >= lastBullFVGLow and close <= lastBullFVGHigh
+inBearFVG = not na(lastBearFVGHigh) and not bearFVGMitigated and close >= lastBearFVGLow and close <= lastBearFVGHigh
+
+// ═══════════════════════════════════════════
+// 4. ORDER BLOCKS
+// ═══════════════════════════════════════════
+var float bullOBHigh = na
+var float bullOBLow  = na
+var int   bullOBBar  = 0
+var bool  bullOBValid = false
+var float bearOBHigh = na
+var float bearOBLow  = na
+var int   bearOBBar  = 0
+var bool  bearOBValid = false
+
+// Displacement check: body > ATR * multiplier
+bodySize = math.abs(close - open)
+isDisplacement = bodySize > atrVal * dispATR
+
+// Bullish OB: last bearish candle before bullish displacement
+if isDisplacement and close > open and close[1] < open[1]
+    bullOBHigh := high[1]
+    bullOBLow  := low[1]
+    bullOBBar  := bar_index - 1
+    bullOBValid := true
+
+// Bearish OB: last bullish candle before bearish displacement
+if isDisplacement and close < open and close[1] > open[1]
+    bearOBHigh := high[1]
+    bearOBLow  := low[1]
+    bearOBBar  := bar_index - 1
+    bearOBValid := true
+
+// Check if OB is still unmitigated
+if bullOBValid and low < bullOBLow
+    bullOBValid := false
+if bearOBValid and high > bearOBHigh
+    bearOBValid := false
+
+inBullOB = bullOBValid and close >= bullOBLow and close <= bullOBHigh
+inBearOB = bearOBValid and close >= bearOBLow and close <= bearOBHigh
+
+// ═══════════════════════════════════════════
+// 5. LIQUIDITY SWEEP
+// ═══════════════════════════════════════════
+var int  lastSweepBar = -999
+var string lastSweepType = ""
+
+// Bullish sweep: wick below lastSwingLow, close back above
+bullSweep = not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow
+// Bearish sweep: wick above lastSwingHigh, close back below
+bearSweep = not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh
+
+if bullSweep
+    lastSweepBar := bar_index
+    lastSweepType := "Bullish Sweep (SSL)"
+if bearSweep
+    lastSweepBar := bar_index
+    lastSweepType := "Bearish Sweep (BSL)"
+
+// Sweep is "recent" if within last 10 bars
+recentSweep = (bar_index - lastSweepBar) <= 10
+
+// ═══════════════════════════════════════════
+// 6. PREMIUM / DISCOUNT
+// ═══════════════════════════════════════════
+rangeHigh = not na(lastSwingHigh) ? lastSwingHigh : na
+rangeLow  = not na(lastSwingLow) ? lastSwingLow : na
+rangeMid  = not na(rangeHigh) and not na(rangeLow) ? (rangeHigh + rangeLow) / 2.0 : na
+
+inDiscount  = not na(rangeMid) and close < rangeMid
+inPremium   = not na(rangeMid) and close > rangeMid
+
+// OTE zone (61.8% - 78.6% retracement)
+oteTop    = not na(rangeHigh) and not na(rangeLow) ? rangeLow + (rangeHigh - rangeLow) * 0.618 : na
+oteBottom = not na(rangeHigh) and not na(rangeLow) ? rangeLow + (rangeHigh - rangeLow) * 0.786 : na
+inOTE     = not na(oteTop) and close >= oteBottom and close <= oteTop
+
+// ═══════════════════════════════════════════
+// 7. LTF CONFIRMATION (via request.security)
+// ═══════════════════════════════════════════
+// v6: dynamic requests are on by default
+lTFFVG = request.security(syminfo.tickerid, lTF, low > high[2] ? 1 : (high < low[2] ? -1 : 0), lookahead=barmerge.lookahead_off)
+lTFHigh = request.security(syminfo.tickerid, lTF, ta.pivothigh(high, 3, 3), lookahead=barmerge.lookahead_off)
+lTFLow  = request.security(syminfo.tickerid, lTF, ta.pivotlow(low, 3, 3), lookahead=barmerge.lookahead_off)
+
+var float lTFLastHigh = na
+var float lTFLastLow  = na
+if not na(lTFHigh)
+    lTFLastHigh := lTFHigh
+if not na(lTFLow)
+    lTFLastLow := lTFLow
+
+// LTF structure shift in our direction
+lTFBullShift = not na(lTFLastHigh) and close > lTFLastHigh
+lTFBearShift = not na(lTFLastLow) and close < lTFLastLow
+
+lTFConfirmsBull = lTFBullShift or (lTFFVG == 1)
+lTFConfirmsBear = lTFBearShift or (lTFFVG == -1)
+
+// ═══════════════════════════════════════════
+// 8. KILLZONE TIMING
+// ═══════════════════════════════════════════
+inLondonKZ = kzLondon and hour(time, "America/New_York") >= 7 and hour(time, "America/New_York") < 10
+inNYKZ     = kzNY and hour(time, "America/New_York") >= 13 and hour(time, "America/New_York") < 16
+inKillzone = inLondonKZ or inNYKZ
+
+// ═══════════════════════════════════════════
+// HTF BIAS (Condition 1)
+// ═══════════════════════════════════════════
+htfClose = request.security(syminfo.tickerid, htfTF, close, lookahead=barmerge.lookahead_off)
+htfOpen  = request.security(syminfo.tickerid, htfTF, open, lookahead=barmerge.lookahead_off)
+htfPH    = request.security(syminfo.tickerid, htfTF, ta.pivothigh(high, 5, 5), lookahead=barmerge.lookahead_off)
+htfPL    = request.security(syminfo.tickerid, htfTF, ta.pivotlow(low, 5, 5), lookahead=barmerge.lookahead_off)
+
+var float htfLastPH = na
+var float htfLastPL = na
+if not na(htfPH)
+    htfLastPH := htfPH
+if not na(htfPL)
+    htfLastPL := htfPL
+
+htfBullBias = structureDir == 1 and (not na(htfLastPL) ? close > htfLastPL : true)
+htfBearBias = structureDir == -1 and (not na(htfLastPH) ? close < htfLastPH : true)
+
+// ═══════════════════════════════════════════
+// 8-CONDITION SCORING
+// ═══════════════════════════════════════════
+isBullishSetup = structureDir == 1
+isBearishSetup = structureDir == -1
+
+// CONDITION 1: HTF Bias
+c1 = isBullishSetup ? htfBullBias : (isBearishSetup ? htfBearBias : false)
+
+// CONDITION 2: Valid POI (OB or FVG or OTE)
+c2 = isBullishSetup ? (inBullOB or inBullFVG or inOTE) : (isBearishSetup ? (inBearOB or inBearFVG or inOTE) : false)
+
+// CONDITION 3: Liquidity Sweep
+c3 = recentSweep and (isBullishSetup ? lastSweepType == "Bullish Sweep (SSL)" : lastSweepType == "Bearish Sweep (BSL)")
+
+// CONDITION 4: Displacement with FVG
+c4 = isBullishSetup ? (isDisplacement and close > open and bullFVG) : (isBearishSetup ? (isDisplacement and close < open and bearFVG) : false)
+
+// CONDITION 5: BOS/CHoCH confirmed (body close, recent)
+c5 = (bar_index - lastBOSBar < 15 or bar_index - lastCHoCHBar < 15) and recentStructure
+
+// CONDITION 6: Premium/Discount correct
+c6 = isBullishSetup ? inDiscount : (isBearishSetup ? inPremium : false)
+
+// CONDITION 7: LTF Structure Shift
+c7 = isBullishSetup ? lTFConfirmsBull : (isBearishSetup ? lTFConfirmsBear : false)
+
+// CONDITION 8: Killzone + SL/TP definable
+c8 = inKillzone and not na(rangeHigh) and not na(rangeLow)
+
+// Total score
+score = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3 ? 1 : 0) + (c4 ? 1 : 0) + (c5 ? 1 : 0) + (c6 ? 1 : 0) + (c7 ? 1 : 0) + (c8 ? 1 : 0)
+
+allConfirmed = score == 8
+buySignal  = allConfirmed and isBullishSetup
+sellSignal = allConfirmed and isBearishSetup
+
+// ═══════════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════════
+// Swing labels
+if not na(ph) and showAll
+    label.new(bar_index - pivotLen, ph, isHH ? "HH" : isLH ? "LH" : "SH",
+         style=label.style_label_down, color=color.new(color.gray, 60),
+         size=size.small, textcolor=color.white)
+
+if not na(pl) and showAll
+    label.new(bar_index - pivotLen, pl, isHL ? "HL" : isLL ? "LL" : "SL",
+         style=label.style_label_up, color=color.new(color.gray, 60),
+         size=size.small, textcolor=color.white)
+
+// BOS / CHoCH lines
+if (bosBull or chochBull) and showAll
+    line.new(lastSwingHighBar, lastSwingHigh, bar_index, close,
+         color=bosBull ? color.new(color.green, 30) : color.new(color.lime, 30),
+         width=2, style=line.style_dashed)
+    label.new(bar_index, close, bosBull ? "BOS" : "CHoCH",
+         style=label.style_label_up, color=bosBull ? color.green : color.lime, size=size.small)
+
+if (bosBear or chochBear) and showAll
+    line.new(lastSwingLowBar, lastSwingLow, bar_index, close,
+         color=bosBear ? color.new(color.red, 30) : color.new(color.orange, 30),
+         width=2, style=line.style_dashed)
+    label.new(bar_index, close, bosBear ? "BOS" : "CHoCH",
+         style=label.style_label_down, color=bosBear ? color.red : color.orange, size=size.small)
+
+// FVG boxes
+if bullFVG and showAll
+    box.new(bar_index - 2, lastBullFVGHigh, bar_index + 15, lastBullFVGLow,
+         bgcolor=color.new(color.green, 85), border_color=color.new(color.green, 50))
+
+if bearFVG and showAll
+    box.new(bar_index - 2, lastBearFVGHigh, bar_index + 15, lastBearFVGLow,
+         bgcolor=color.new(color.red, 85), border_color=color.new(color.red, 50))
+
+// Order Block boxes
+if bullOBValid and showAll
+    box.new(bullOBBar, bullOBHigh, bar_index + 20, bullOBLow,
+         bgcolor=color.new(color.teal, 80), border_color=color.new(color.teal, 40), border_width=2)
+
+if bearOBValid and showAll
+    box.new(bearOBBar, bearOBHigh, bar_index + 20, bearOBLow,
+         bgcolor=color.new(color.maroon, 80), border_color=color.new(color.maroon, 40), border_width=2)
+
+// Liquidity Sweep labels
+if bullSweep and showAll
+    label.new(bar_index, low, "SWEEP", style=label.style_label_up,
+         color=color.new(color.blue, 20), size=size.small)
+
+if bearSweep and showAll
+    label.new(bar_index, high, "SWEEP", style=label.style_label_down,
+         color=color.new(color.red, 20), size=size.small)
+
+// Premium/Discount background
+if not na(rangeMid) and showAll
+    box.new(bar_index - 50, rangeLow, bar_index + 5, rangeMid,
+         bgcolor=color.new(color.green, 93), border_color=color.new(color.green, 90))
+    box.new(bar_index - 50, rangeMid, bar_index + 5, rangeHigh,
+         bgcolor=color.new(color.red, 93), border_color=color.new(color.red, 90))
+    line.new(bar_index - 50, rangeMid, bar_index + 5, rangeMid,
+         color=color.new(color.yellow, 40), width=1, style=line.style_dotted)
+
+// Signal markers
+plotshape(buySignal, "BUY", shape.triangleup, location.belowbar,
+     color=color.new(color.green, 0), size=size.large, text="BUY")
+plotshape(sellSignal, "SELL", shape.triangledown, location.abovebar,
+     color=color.new(color.red, 0), size=size.large, text="SELL")
+
+// Partial score markers (5-7 conditions)
+plotshape(score >= 5 and score < 8 and isBullishSetup, "Setup+", shape.diamond, location.belowbar,
+     color=color.new(color.teal, 30), size=size.small)
+plotshape(score >= 5 and score < 8 and isBearishSetup, "Setup-", shape.diamond, location.abovebar,
+     color=color.new(color.orange, 30), size=size.small)
+
+// ═══════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════
+var table dash = na
+
+if showDash and barstate.islast
+    if na(dash)
+        dash := table.new(dashPos == "Top Right" ? position.top_right : dashPos == "Top Left" ? position.top_left : dashPos == "Bottom Right" ? position.bottom_right : position.bottom_left,
+             3, 11, bgcolor=color.new(color.black, 80), border_width=1, border_color=color.new(color.gray, 60))
+
+    // Header
+    table.cell(dash, 0, 0, "SMC 8-CONDITION [v6]", text_color=color.white, text_size=size.normal, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "STATUS", text_color=color.white, text_size=size.normal, text_halign=text.align_center)
+    table.cell(dash, 2, 0, "DETAIL", text_color=color.white, text_size=size.normal, text_halign=text.align_center)
+
+    // Score row
+    scoreColor = allConfirmed ? color.green : score >= 5 ? color.yellow : color.red
+    table.cell(dash, 0, 1, "SCORE", text_color=color.white, text_size=size.normal)
+    table.cell(dash, 1, 1, str.tostring(score) + "/8", text_color=scoreColor, text_size=size.large, text_halign=text.align_center)
+    table.cell(dash, 2, 1, allConfirmed ? "ALL MET" : score >= 5 ? "PARTIAL" : "INCOMPLETE", text_color=scoreColor, text_size=size.small)
+
+    // Direction
+    dirText = isBullishSetup ? "BULLISH" : isBearishSetup ? "BEARISH" : "NEUTRAL"
+    dirColor = isBullishSetup ? color.green : isBearishSetup ? color.red : color.gray
+    table.cell(dash, 0, 2, "BIAS", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, dirText, text_color=dirColor, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 2, 2, lastStructureLabel, text_color=color.gray, text_size=size.small)
+
+    // Condition 1
+    table.cell(dash, 0, 3, "1. HTF Bias", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, c1 ? "OK" : "X", text_color=c1 ? color.green : color.red, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 2, 3, c1 ? "Aligned" : "Misaligned", text_color=c1 ? color.green : color.red, text_size=size.tiny)
+
+    // Condition 2
+    table.cell(dash, 0, 4, "2. POI Zone", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, c2 ? "OK" : "X", text_color=c2 ? color.green : color.red, text_size=size.small, text_halign=text.align_center)
+    poiDetail = inBullOB or inBearOB ? "OB" : inBullFVG or inBearFVG ? "FVG" : inOTE ? "OTE" : "None"
+    table.cell(dash, 2, 4, poiDetail, text_color=c2 ? color.green : color.gray, text_size=size.tiny)
+
+    // Condition 3
+    table.cell(dash, 0, 5, "3. Liq Sweep", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, c3 ? "OK" : "X", text_color=c3 ? color.green : color.red, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 2, 5, c3 ? lastSweepType : "No sweep", text_color=c3 ? color.green : color.gray, text_size=size.tiny)
+
+    // Condition 4
+    table.cell(dash, 0, 6, "4. Displacement", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, c4 ? "OK" : "X", text_color=c4 ? color.green : color.red, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 2, 6, c4 ? "FVG + Impulse" : "Weak", text_color=c4 ? color.green : color.gray, text_size=size.tiny)
+
+    // Condition 5
+    table.cell(dash, 0, 7, "5. BOS/CHoCH", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, c5 ? "OK" : "X", text_color=c5 ? color.green : color.red, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 2, 7, c5 ? lastBOSType : "No recent", text_color=c5 ? color.green : color.gray, text_size=size.tiny)
+
+    // Condition 6
+    table.cell(dash, 0, 8, "6. Prem/Disc", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 8, c6 ? "OK" : "X", text_color=c6 ? color.green : color.red, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 2, 8, c6 ? (inDiscount ? "Discount" : "Premium") : "Equilibrium", text_color=c6 ? color.green : color.gray, text_size=size.tiny)
+
+    // Condition 7
+    table.cell(dash, 0, 9, "7. LTF Shift", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 9, c7 ? "OK" : "X", text_color=c7 ? color.green : color.red, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 2, 9, c7 ? "Confirmed" : "Pending", text_color=c7 ? color.green : color.gray, text_size=size.tiny)
+
+    // Condition 8
+    table.cell(dash, 0, 10, "8. Killzone", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 10, c8 ? "OK" : "X", text_color=c8 ? color.green : color.red, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 2, 10, c8 ? (inLondonKZ ? "London" : "NY") : "Outside", text_color=c8 ? color.green : color.gray, text_size=size.tiny)
+
+// ═══════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════
+alertcondition(buySignal, "All 8 BUY", "SMC v6: All 8 conditions met for BUY")
+alertcondition(sellSignal, "All 8 SELL", "SMC v6: All 8 conditions met for SELL")
+alertcondition(score >= 6, "Score 6+", "SMC v6: 6+ conditions met")
+alertcondition(bullSweep, "Liquidity Sweep", "SMC v6: Liquidity sweep detected")
+alertcondition(chochBull or chochBear, "CHoCH", "SMC v6: Change of Character detected")   
