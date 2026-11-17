@@ -1,0 +1,110 @@
+//@version=6
+indicator("Order Flow & Candle Volume Delta [v6]", overlay=false, format=format.volume)
+
+// ═══════════════════════════════════════════════════════════
+// INPUTS & CONFIGURATION
+// ═══════════════════════════════════════════════════════════
+calcMethod   = input.string("Hybrid (Intrabar LTF + Anatomy Fallback)", "Calculation Method", 
+                 options=["Hybrid (Intrabar LTF + Anatomy Fallback)", "Bar Anatomy (Wicks/Body)", "Intrabar LTF Only"])
+ltfTimeframe = input.timeframe("1", "Intrabar Lower Timeframe (for LTF mode)")
+showLabels   = input.bool(true, "Show Candle Volume Labels on Chart (Data Window / Hover)")
+showCVD      = input.bool(true, "Show Cumulative Volume Delta (CVD) Line")
+resetDaily   = input.bool(true, "Reset CVD Daily")
+imbalanceThr = input.float(1.5, "Volume Imbalance Ratio (e.g. 1.5 = 150%)", minval=1.0, step=0.1)
+
+// ═══════════════════════════════════════════════════════════
+// 1. BAR ANATOMY METHOD (Wick & Body Range Distribution)
+// ═══════════════════════════════════════════════════════════
+// Range-based volume split:
+// - Lower wick + bullish body represents aggressive buyers
+// - Upper wick + bearish body represents aggressive sellers
+rng = high - low
+candleBuyRatio = rng > 0 ? (close - low) / rng : 0.5
+candleSellRatio = rng > 0 ? (high - close) / rng : 0.5
+
+anatomyBuyVol  = volume * candleBuyRatio
+anatomySellVol = volume * candleSellRatio
+
+// ═══════════════════════════════════════════════════════════
+// 2. INTRABAR LOWER-TIMEFRAME (LTF) METHOD
+// ═══════════════════════════════════════════════════════════
+// request.security_lower_tf retrieves lower-timeframe bars within current chart bar
+ltfCloses = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, close)
+ltfOpens  = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, open)
+ltfVols   = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, volume)
+
+float ltfBuyVol  = 0.0
+float ltfSellVol = 0.0
+bool  hasLtfData = false
+
+if array.size(ltfCloses) > 0
+    hasLtfData := true
+    for i = 0 to array.size(ltfCloses) - 1
+        c = array.get(ltfCloses, i)
+        o = array.get(ltfOpens, i)
+        v = array.get(ltfVols, i)
+        if c > o
+            ltfBuyVol += v
+        else if c < o
+            ltfSellVol += v
+        else
+            // Neutral intrabar: split 50/50
+            ltfBuyVol  += v * 0.5
+            ltfSellVol += v * 0.5
+
+// ═══════════════════════════════════════════════════════════
+// 3. RESOLVE BUY / SELL VOLUME
+// ═══════════════════════════════════════════════════════════
+float buyVolume  = na
+float sellVolume = na
+
+if calcMethod == "Intrabar LTF Only"
+    buyVolume  := hasLtfData ? ltfBuyVol : na
+    sellVolume := hasLtfData ? ltfSellVol : na
+else if calcMethod == "Bar Anatomy (Wicks/Body)"
+    buyVolume  := anatomyBuyVol
+    sellVolume := anatomySellVol
+else // Hybrid
+    buyVolume  := hasLtfData ? ltfBuyVol : anatomyBuyVol
+    sellVolume := hasLtfData ? ltfSellVol : anatomySellVol
+
+// Delta = Net Order Flow Volume (Positive = Bullish, Negative = Bearish)
+delta = buyVolume - sellVolume
+deltaPct = volume > 0 ? (delta / volume) * 100 : 0.0
+
+// Imbalance detection
+isBuyImbalance  = sellVolume > 0 and (buyVolume / sellVolume) >= imbalanceThr
+isSellImbalance = buyVolume > 0 and (sellVolume / buyVolume) >= imbalanceThr
+
+// ═══════════════════════════════════════════════════════════
+// 4. CUMULATIVE VOLUME DELTA (CVD)
+// ═══════════════════════════════════════════════════════════
+var float cvd = 0.0
+isNewDay = timeframe.isintraday and ta.change(time("D")) != 0
+
+if resetDaily and isNewDay
+    cvd := nz(delta)
+else
+    cvd := cvd + nz(delta)
+
+// ═══════════════════════════════════════════════════════════
+// 5. PLOTS & VISUALS
+// ═══════════════════════════════════════════════════════════
+// Stacked or Delta Volume Histogram
+deltaColor = delta >= 0 ? color.new(color.green, 30) : color.new(color.red, 30)
+plot(delta, "Delta Volume (Net)", color=deltaColor, style=plot.style_columns)
+
+// Buy / Sell Volume Lines in Data Window & Chart Pane
+plot(buyVolume,  "Buy Volume",  color=color.new(color.teal, 20), linewidth=1)
+plot(sellVolume, "Sell Volume", color=color.new(color.orange, 20), linewidth=1)
+
+// Zero Reference Line
+hline(0, "Zero Line", color=color.gray, linestyle=hline.style_dotted)
+
+// Cumulative Volume Delta (CVD)
+plot(showCVD ? cvd : na, "CVD (Cumulative Delta)", color=color.yellow, linewidth=2)
+
+// Highlight Imbalance bars
+plotshape(isBuyImbalance, "Buy Imbalance", shape.triangleup, location.bottom, color=color.green, size=size.tiny)
+plotshape(isSellImbalance, "Sell Imbalance", shape.triangledown, location.top, color=color.red, size=size.tiny)
+

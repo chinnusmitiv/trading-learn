@@ -12,11 +12,15 @@ showDash    = input.bool(true, "Show Dashboard")
 dashPos     = input.string("Top Right", "Dashboard Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"])
 kzLondon    = input.bool(true, "Use London Killzone (07:00-10:00 NY)")
 kzNY        = input.bool(true, "Use NY Killzone (13:00-16:00 NY)")
-dispATR     = input.float(1.5, "Displacement ATR Multiplier", minval=0.5, step=0.1)
-atrLen      = input.int(14, "ATR Length")
-rrRatio     = input.float(3.0, "Risk:Reward Ratio for TP", minval=1.0, step=0.5)
-showETP     = input.bool(true, "Show Entry/SL/TP Lines")
-lineLength  = input.int(30, "Line Length (bars ahead)", minval=10, maxval=100)
+minScore          = input.int(6, "Min Score Required for Signal (out of 8)", minval=5, maxval=8)
+dispATR           = input.float(1.5, "Displacement ATR Multiplier", minval=0.5, step=0.1)
+atrLen            = input.int(14, "ATR Length")
+rrRatio           = input.float(3.0, "Risk:Reward Ratio for TP", minval=1.0, step=0.5)
+showETP           = input.bool(true, "Show Projected Entry/SL/TP Lines")
+lineLength        = input.int(30, "Projected Lines Length (bars ahead)", minval=10, maxval=100)
+showCandleOverlay = input.bool(true, "Show Entry/SL/TP Overlay on Candle")
+candleCardStyle   = input.string("Detailed", "Candle Overlay Style", options=["Detailed", "Compact"])
+keepAllCards      = input.bool(true, "Keep All Signal Candle Overlays on Chart")
 
 // ═══════════════════════════════════════════
 // ATR
@@ -209,7 +213,7 @@ lTFConfirmsBear = lTFBearShift or (lTFFVG == -1)
 // ═══════════════════════════════════════════
 inLondonKZ = kzLondon and hour(time, "America/New_York") >= 7 and hour(time, "America/New_York") < 10
 inNYKZ     = kzNY and hour(time, "America/New_York") >= 13 and hour(time, "America/New_York") < 16
-inKillzone = inLondonKZ or inNYKZ
+inKillzone = not timeframe.isintraday ? true : ((not kzLondon and not kzNY) ? true : (inLondonKZ or inNYKZ))
 
 // ═══════════════════════════════════════════
 // HTF BIAS
@@ -236,7 +240,11 @@ isBearishSetup = structureDir == -1
 c1 = isBullishSetup ? htfBullBias : (isBearishSetup ? htfBearBias : false)
 c2 = isBullishSetup ? (inBullOB or inBullFVG or inOTE) : (isBearishSetup ? (inBearOB or inBearFVG or inOTE) : false)
 c3 = recentSweep and (isBullishSetup ? lastSweepType == "Bullish Sweep (SSL)" : lastSweepType == "Bearish Sweep (BSL)")
-c4 = isBullishSetup ? (isDisplacement and close > open and bullFVG) : (isBearishSetup ? (isDisplacement and close < open and bearFVG) : false)
+dispBull = isDisplacement and close > open and bullFVG
+dispBear = isDisplacement and close < open and bearFVG
+recentDispBull = ta.barssince(dispBull) <= 5
+recentDispBear = ta.barssince(dispBear) <= 5
+c4 = isBullishSetup ? recentDispBull : (isBearishSetup ? recentDispBear : false)
 c5 = (bar_index - lastBOSBar < 15 or bar_index - lastCHoCHBar < 15) and recentStructure
 c6 = isBullishSetup ? inDiscount : (isBearishSetup ? inPremium : false)
 c7 = isBullishSetup ? lTFConfirmsBull : (isBearishSetup ? lTFConfirmsBear : false)
@@ -244,7 +252,7 @@ c8 = inKillzone and not na(rangeHigh) and not na(rangeLow)
 
 score = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3 ? 1 : 0) + (c4 ? 1 : 0) + (c5 ? 1 : 0) + (c6 ? 1 : 0) + (c7 ? 1 : 0) + (c8 ? 1 : 0)
 
-allConfirmed = score == 8
+allConfirmed = score >= minScore
 buySignal  = allConfirmed and isBullishSetup
 sellSignal = allConfirmed and isBearishSetup
 
@@ -363,16 +371,56 @@ if not na(rangeMid) and showAll
     line.new(bar_index - 50, rangeMid, bar_index + 5, rangeMid,
          color=color.new(color.yellow, 40), width=1, style=line.style_dotted)
 
-// Signal markers
-plotshape(buySignal, "BUY", shape.triangleup, location.belowbar,
+// Signal markers (shown if candle overlay is off)
+plotshape(buySignal and not showCandleOverlay, "BUY", shape.triangleup, location.belowbar,
      color=color.new(color.green, 0), size=size.large, text="BUY")
-plotshape(sellSignal, "SELL", shape.triangledown, location.abovebar,
+plotshape(sellSignal and not showCandleOverlay, "SELL", shape.triangledown, location.abovebar,
      color=color.new(color.red, 0), size=size.large, text="SELL")
 
 plotshape(score >= 5 and score < 8 and isBullishSetup, "Setup+", shape.diamond, location.belowbar,
      color=color.new(color.teal, 30), size=size.small)
 plotshape(score >= 5 and score < 8 and isBearishSetup, "Setup-", shape.diamond, location.abovebar,
      color=color.new(color.orange, 30), size=size.small)
+
+// ═══════════════════════════════════════════
+// CANDLE OVERLAY (Entry / SL / TP directly on Signal Candle)
+// ═══════════════════════════════════════════
+var label candleCardLbl = na
+var int   lastCardBar   = -999
+
+if showCandleOverlay and (buySignal or sellSignal)
+    // Clean up intra-bar repaint or prior signal if keepAllCards is false
+    if not keepAllCards and not na(candleCardLbl)
+        label.delete(candleCardLbl)
+    else if lastCardBar == bar_index and not na(candleCardLbl)
+        label.delete(candleCardLbl)
+
+    string riskStr   = str.tostring(math.abs(entryPrice - slPrice), format.mintick)
+    string rewardStr = str.tostring(math.abs(tpPrice - entryPrice), format.mintick)
+    string rrStr     = str.tostring(rrRatio, "#.#") + ":1"
+    string sigHeader = buySignal ? "▲ BUY SIGNAL" : "▼ SELL SIGNAL"
+    string slSign    = buySignal ? "-" : "+"
+    string tpSign    = buySignal ? "+" : "-"
+
+    string cardText = ""
+    if candleCardStyle == "Detailed"
+        cardText := sigHeader + "\n─────────────\n"
+        cardText := cardText + "Entry: " + str.tostring(entryPrice, format.mintick) + "\n"
+        cardText := cardText + "SL:    " + str.tostring(slPrice, format.mintick) + " (" + slSign + riskStr + ")\n"
+        cardText := cardText + "TP:    " + str.tostring(tpPrice, format.mintick) + " (" + tpSign + rewardStr + ")\n"
+        cardText := cardText + "R:R:   " + rrStr
+    else // Compact
+        cardText := (buySignal ? "▲ BUY " : "▼ SELL ") + str.tostring(entryPrice, format.mintick) + "\n"
+        cardText := cardText + "SL: " + str.tostring(slPrice, format.mintick) + " | TP: " + str.tostring(tpPrice, format.mintick) + " (" + rrStr + ")"
+
+    color cardBg   = buySignal ? color.new(#0b6623, 10) : color.new(#8b0000, 10)
+    float cardY    = buySignal ? low : high
+    string cardSty = buySignal ? label.style_label_up : label.style_label_down
+
+    candleCardLbl := label.new(bar_index, cardY, cardText,
+         color=cardBg, textcolor=color.white,
+         style=cardSty, size=candleCardStyle == "Detailed" ? size.small : size.tiny)
+    lastCardBar := bar_index
 
 // ═══════════════════════════════════════════
 // ENTRY / SL / TP LINES + LABELS (NEW)
@@ -413,7 +461,7 @@ if showETP and (buySignal or sellSignal)
          color=buySignal ? color.green : color.red, width=2, style=line.style_solid)
     entryLbl := label.new(endBar, entryPrice,
          "ENTRY: " + str.tostring(entryPrice, format.mintick),
-         style=buySignal ? label.style_label_left : label.style_label_left,
+         style=label.style_label_left,
          color=buySignal ? color.new(color.green, 20) : color.new(color.red, 20),
          textcolor=color.white, size=size.small)
 
@@ -440,23 +488,23 @@ if showETP and (buySignal or sellSignal)
          bgcolor=buySignal ? color.new(color.green, 92) : color.new(color.red, 92),
          border_color=color.new(color.gray, 70), border_width=1)
 
-    // --- DETAILED TEXT BOX (top-left of the zone) ---
-    string rrStr = str.tostring(rrRatio, "#.#") + ":1"
-    string riskStr = str.tostring(math.abs(entryPrice - slPrice), format.mintick)
-    string rewardStr = str.tostring(math.abs(tpPrice - entryPrice), format.mintick)
+    // --- DETAILED FLOATING TEXT BOX (shown only when candle overlay is off) ---
+    if not showCandleOverlay
+        string rrStr = str.tostring(rrRatio, "#.#") + ":1"
+        string riskStr = str.tostring(math.abs(entryPrice - slPrice), format.mintick)
+        string rewardStr = str.tostring(math.abs(tpPrice - entryPrice), format.mintick)
 
-    string boxText = signalType + " SIGNAL\n" +
-         "─────────────\n" +
-         "Entry: " + str.tostring(entryPrice, format.mintick) + "\n" +
-         "SL:    " + str.tostring(slPrice, format.mintick) + " (" + riskStr + ")\n" +
-         "TP:    " + str.tostring(tpPrice, format.mintick) + " (" + rewardStr + ")\n" +
-         "R:R:   " + rrStr
+        string boxText = signalType + " SIGNAL\n─────────────\n"
+        boxText := boxText + "Entry: " + str.tostring(entryPrice, format.mintick) + "\n"
+        boxText := boxText + "SL:    " + str.tostring(slPrice, format.mintick) + " (" + riskStr + ")\n"
+        boxText := boxText + "TP:    " + str.tostring(tpPrice, format.mintick) + " (" + rewardStr + ")\n"
+        boxText := boxText + "R:R:   " + rrStr
 
-    detailLbl := label.new(signalBar + 2, buySignal ? tpPrice : slPrice,
-         boxText,
-         style=label.style_label_lower_right,
-         color=color.new(color.black, 75),
-         textcolor=color.white, size=size.small)
+        detailLbl := label.new(signalBar + 2, buySignal ? tpPrice : slPrice,
+             boxText,
+             style=label.style_label_lower_right,
+             color=color.new(color.black, 75),
+             textcolor=color.white, size=size.small)
 
 // ═══════════════════════════════════════════
 // DASHBOARD (with ETP section)

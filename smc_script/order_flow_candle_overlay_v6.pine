@@ -1,0 +1,134 @@
+//@version=6
+indicator("Order Flow Candle Volume [v6 - Overlay]", overlay=true, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════
+calcMethod   = input.string("Hybrid (Intrabar LTF + Anatomy Fallback)", "Calculation Method", 
+                 options=["Hybrid (Intrabar LTF + Anatomy Fallback)", "Bar Anatomy (Wicks/Body)", "Intrabar LTF Only"])
+ltfTimeframe = input.timeframe("1", "Intrabar Lower Timeframe")
+showLabels   = input.bool(true, "Show Volume Labels on Recent Candles")
+labelCount   = input.int(20, "Number of Recent Candles to Label", minval=5, maxval=100)
+showLiveTable = input.bool(true, "Show Live Candle Order Flow Table")
+tablePos     = input.string("Bottom Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+
+// ═══════════════════════════════════════════════════════════
+// 1. BAR ANATOMY METHOD
+// ═══════════════════════════════════════════════════════════
+rng = high - low
+candleBuyRatio = rng > 0 ? (close - low) / rng : 0.5
+candleSellRatio = rng > 0 ? (high - close) / rng : 0.5
+
+anatomyBuyVol  = volume * candleBuyRatio
+anatomySellVol = volume * candleSellRatio
+
+// ═══════════════════════════════════════════════════════════
+// 2. INTRABAR LOWER-TIMEFRAME (LTF) METHOD
+// ═══════════════════════════════════════════════════════════
+ltfCloses = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, close)
+ltfOpens  = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, open)
+ltfVols   = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, volume)
+
+float ltfBuyVol  = 0.0
+float ltfSellVol = 0.0
+bool  hasLtfData = false
+
+if array.size(ltfCloses) > 0
+    hasLtfData := true
+    for i = 0 to array.size(ltfCloses) - 1
+        c = array.get(ltfCloses, i)
+        o = array.get(ltfOpens, i)
+        v = array.get(ltfVols, i)
+        if c > o
+            ltfBuyVol += v
+        else if c < o
+            ltfSellVol += v
+        else
+            ltfBuyVol  += v * 0.5
+            ltfSellVol += v * 0.5
+
+// ═══════════════════════════════════════════════════════════
+// 3. RESOLVE BUY / SELL VOLUME
+// ═══════════════════════════════════════════════════════════
+float buyVolume  = na
+float sellVolume = na
+
+if calcMethod == "Intrabar LTF Only"
+    buyVolume  := hasLtfData ? ltfBuyVol : na
+    sellVolume := hasLtfData ? ltfSellVol : na
+else if calcMethod == "Bar Anatomy (Wicks/Body)"
+    buyVolume  := anatomyBuyVol
+    sellVolume := anatomySellVol
+else
+    buyVolume  := hasLtfData ? ltfBuyVol : anatomyBuyVol
+    sellVolume := hasLtfData ? ltfSellVol : anatomySellVol
+
+delta = buyVolume - sellVolume
+totalVol = buyVolume + sellVolume
+buyPct  = totalVol > 0 ? (buyVolume / totalVol) * 100 : 50.0
+sellPct = totalVol > 0 ? (sellVolume / totalVol) * 100 : 50.0
+
+// Helper to format volume nicely (e.g. 1.2M, 45.6K, 120)
+f_formatVol(val) =>
+    aVal = math.abs(val)
+    if aVal >= 1000000
+        str.tostring(val / 1000000, "#.##") + "M"
+    else if aVal >= 1000
+        str.tostring(val / 1000, "#.#") + "K"
+    else
+        str.tostring(val, "#")
+
+// ═══════════════════════════════════════════════════════════
+// 4. CANDLE LABELS ON CHART
+// ═══════════════════════════════════════════════════════════
+var label[] activeLabels = array.new_label()
+
+if showLabels and not na(buyVolume)
+    // Keep only the most recent N labels to prevent chart clutter and stay under TV limits
+    string lblText = "B: " + f_formatVol(buyVolume) + " (" + str.tostring(buyPct, "#") + "%)\n" +
+                     "S: " + f_formatVol(sellVolume) + " (" + str.tostring(sellPct, "#") + "%)\n" +
+                     "Δ: " + (delta >= 0 ? "+" : "") + f_formatVol(delta)
+
+    lblColor = delta >= 0 ? color.new(color.teal, 20) : color.new(color.maroon, 20)
+    lblStyle = close >= open ? label.style_label_up : label.style_label_down
+    lblY     = close >= open ? low : high
+
+    lbl = label.new(bar_index, lblY, lblText, 
+              color=lblColor, textcolor=color.white, size=size.tiny, style=lblStyle)
+    array.push(activeLabels, lbl)
+
+    if array.size(activeLabels) > labelCount
+        oldLbl = array.shift(activeLabels)
+        label.delete(oldLbl)
+
+// ═══════════════════════════════════════════════════════════
+// 5. LIVE CANDLE ORDER FLOW TABLE
+// ═══════════════════════════════════════════════════════════
+var table ofTable = na
+
+if showLiveTable and barstate.islast
+    pos = tablePos == "Top Right" ? position.top_right : tablePos == "Top Left" ? position.top_left : tablePos == "Bottom Right" ? position.bottom_right : position.bottom_left
+    if na(ofTable)
+        ofTable := table.new(pos, 2, 6, bgcolor=color.new(color.black, 30), border_width=1, border_color=color.new(color.gray, 60))
+
+    deltaColor = delta >= 0 ? color.green : color.red
+
+    table.cell(ofTable, 0, 0, "CANDLE ORDER FLOW", text_color=color.white, text_size=size.small, text_halign=text.align_center)
+    table.cell(ofTable, 1, 0, "VALUE", text_color=color.white, text_size=size.small, text_halign=text.align_center)
+
+    table.cell(ofTable, 0, 1, "Total Volume", text_color=color.gray, text_size=size.small)
+    table.cell(ofTable, 1, 1, f_formatVol(totalVol), text_color=color.white, text_size=size.small, text_halign=text.align_center)
+
+    table.cell(ofTable, 0, 2, "Buy Volume", text_color=color.green, text_size=size.small)
+    table.cell(ofTable, 1, 2, f_formatVol(buyVolume) + " (" + str.tostring(buyPct, "#.#") + "%)", text_color=color.green, text_size=size.small, text_halign=text.align_center)
+
+    table.cell(ofTable, 0, 3, "Sell Volume", text_color=color.red, text_size=size.small)
+    table.cell(ofTable, 1, 3, f_formatVol(sellVolume) + " (" + str.tostring(sellPct, "#.#") + "%)", text_color=color.red, text_size=size.small, text_halign=text.align_center)
+
+    table.cell(ofTable, 0, 4, "Net Delta (B - S)", text_color=deltaColor, text_size=size.small)
+    table.cell(ofTable, 1, 4, (delta >= 0 ? "+" : "") + f_formatVol(delta), text_color=deltaColor, text_size=size.small, text_halign=text.align_center)
+
+    domSide = delta >= 0 ? "Buyers In Control" : "Sellers In Control"
+    table.cell(ofTable, 0, 5, "Bias", text_color=color.gray, text_size=size.small)
+    table.cell(ofTable, 1, 5, domSide, text_color=deltaColor, text_size=size.small, text_halign=text.align_center)
+
